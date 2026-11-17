@@ -138,11 +138,13 @@ class AcquisitionService(BaseService):
                     break
 
                 logger.warning(f"plugin requested still retry {attempt}/{MAX_STILL_RETRIES}: {retry.reason or 'no reason given'}")
-                backend.still_parameter_overrides = dict(retry.parameters)
+                # retry parameters are applied on top of overrides that plugins may have set persistently before.
+                previous_overrides = backend.still_parameter_overrides
+                backend.still_parameter_overrides = {**previous_overrides, **retry.parameters}
                 try:
                     file = backend.wait_for_still_file(index_subdevice=index_subdevice)
                 finally:
-                    backend.still_parameter_overrides = {}
+                    backend.still_parameter_overrides = previous_overrides
 
             return file
         except Exception as exc:

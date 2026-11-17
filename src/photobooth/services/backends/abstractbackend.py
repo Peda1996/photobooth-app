@@ -285,6 +285,9 @@ class AbstractBackend(ResilientService, ABC):
 
         self._mode_machine = ModeController(self, idle_timeout=self._idle_timeout)
 
+        # camera parameters (name->value) applied additionally on the next switch to still mode, used for retries requested by plugins
+        self.still_parameter_overrides: dict[str, str] = {}
+
         # lores broadcast and ...
         self._lores_data = [LoresBroadcastRes(data=b"", condition=threading.Condition()) for _ in range(self._num_subdevices)]
         # ... hires queue

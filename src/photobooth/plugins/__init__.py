@@ -17,6 +17,7 @@ from statemachine import Event, State
 
 from ..database.types import MediaitemTypes
 from ..models.genericstats import GenericStats
+from ..models.stillretry import StillRetry
 
 pm = pluggy.PluginManager("photobooth-app")
 hookspec = pluggy.HookspecMarker("photobooth-app")
@@ -80,6 +81,12 @@ class PluginAcquisitionSpec:
     @hookspec
     def acq_before_get_multicam(self) -> None:
         """triggers before a multicam still only"""
+
+    @hookspec(firstresult=True)
+    def acq_still_check(self, file: Path) -> StillRetry | None:
+        """called with every captured still file. return None if the capture is fine, or a StillRetry to request one more capture
+        (for example with different camera parameters if the image is black because the flash failed).
+        The first plugin returning a result wins. The app limits the number of retries."""
 
     @hookspec
     def acq_after_shot(self) -> None:

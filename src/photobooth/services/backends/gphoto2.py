@@ -90,7 +90,8 @@ class Gphoto2Backend(AbstractBackend):
 
     def _handle_switchmode_still_mode(self):
         logger.debug("configure camera optimized for still capture")
-        self._handle_switchmode(self._config.parameterset_still)
+        overrides = [Gphoto2Parameters(enabled=True, name=name, value=value) for name, value in self.still_parameter_overrides.items()]
+        self._handle_switchmode(list(self._config.parameterset_still) + overrides)
 
     def _handle_switchmode_standby(self):
         logger.debug("configure camera optimized for standby")

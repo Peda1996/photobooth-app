@@ -88,7 +88,8 @@ class Gphoto2Backend(AbstractBackend):
 
     def _handle_switchmode_video_mode(self):
         logger.debug("configure camera optimized for video")
-        self._handle_switchmode(self._config.parameterset_video)
+        overrides = [Gphoto2Parameters(enabled=True, name=name, value=value) for name, value in self.video_parameter_overrides.items()]
+        self._handle_switchmode(list(self._config.parameterset_video) + overrides)
 
     def _handle_switchmode_still_mode(self):
         logger.debug("configure camera optimized for still capture")
@@ -301,6 +302,13 @@ class Gphoto2Backend(AbstractBackend):
                 # in the logs. to avoid that, we just sleep a bit here effectively frame limiting and
                 # giving gphoto2 time to settle and avoid flooded logs.
                 self._framerate.wait_until_fps(25)
+
+                live_request, self.live_parameter_request = self.live_parameter_request, None
+                if live_request:
+                    try:
+                        self._handle_switchmode([Gphoto2Parameters(enabled=True, name=name, value=value) for name, value in live_request.items()])
+                    except Exception as exc:
+                        logger.warning(f"could not apply live view parameters {live_request}: {exc}")
 
                 try:
                     camera_file = self._camera.capture_preview()

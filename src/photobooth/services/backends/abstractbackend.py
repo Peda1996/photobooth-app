@@ -287,6 +287,10 @@ class AbstractBackend(ResilientService, ABC):
 
         # camera parameters (name->value) applied additionally on every switch to still mode, set by plugins (persistent) or temporarily for retries
         self.still_parameter_overrides: dict[str, str] = {}
+        # same for the live view: video_parameter_overrides are applied on every switch to video mode,
+        # live_parameter_request is applied once by the backend thread while the live view is running (set by plugins)
+        self.video_parameter_overrides: dict[str, str] = {}
+        self.live_parameter_request: dict[str, str] | None = None
 
         # lores broadcast and ...
         self._lores_data = [LoresBroadcastRes(data=b"", condition=threading.Condition()) for _ in range(self._num_subdevices)]

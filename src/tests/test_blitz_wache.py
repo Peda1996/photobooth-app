@@ -58,3 +58,15 @@ def test_disabled_plugin_does_nothing(tmp_path):
     plugin = BlitzWache()
     plugin._config.common.enabled = False
     assert plugin.acq_still_check(_img(tmp_path, "b.jpg", 0)) is None
+
+
+def test_resolve_extreme_choice():
+    from photobooth.utils.cameraparameters import resolve_extreme_choice
+
+    apertures = ["3.5", "4", "5.6", "8", "22"]
+    assert resolve_extreme_choice("min", apertures) == "3.5"
+    assert resolve_extreme_choice("max", apertures) == "22"
+    assert resolve_extreme_choice("min", ["Auto", "100", "200"]) == "100"
+    assert resolve_extreme_choice("max", ["1/4000", "1/60", "1/30", "1", "bulb"]) == "1"
+    assert resolve_extreme_choice("5.6", apertures) == "5.6"
+    assert resolve_extreme_choice("min", ["Auto"]) == "min"

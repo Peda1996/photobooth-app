@@ -7,6 +7,7 @@ from tempfile import NamedTemporaryFile
 
 import gphoto2 as gp
 
+from ...utils.cameraparameters import resolve_extreme_choice
 from ...utils.helper import filename_str_time
 from ..config.groups.cameras import Gphoto2Parameters, GroupCameraGphoto2
 from .abstractbackend import AbstractBackend, StillRequest
@@ -40,6 +41,7 @@ class GpEvents(Enum):
 # assert to ensure our definition is always the same as in libgphoto
 assert {e.name: e.value for e in GpWidgets} == {name: getattr(gp, name) for name in GpWidgets.__members__}, "GP_WIDGET are inconsistent"
 assert {e.name: e.value for e in GpEvents} == {name: getattr(gp, name) for name in GpEvents.__members__}, "GP_EVENT are inconsistent"
+
 
 
 class Gphoto2Backend(AbstractBackend):
@@ -133,6 +135,7 @@ class Gphoto2Backend(AbstractBackend):
             # to the camera and breaks everything. The available choices reported by the camera may differ by the selected mode
             available_choices = [choice for choice in child.get_choices()]
 
+            value_new = resolve_extreme_choice(value_new, available_choices)
             if value_new not in available_choices:
                 raise ValueError(f"{value_new} is not an option for '{name}' in current mode. Available choices are {available_choices}")
 

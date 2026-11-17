@@ -1,4 +1,4 @@
-name: pytest
+name: tests
 
 # coverage is made up by multiple runs on different hosts
 # self-hosted is a RPI and has hardware attached to test and gain high coverage
@@ -11,37 +11,40 @@ permissions:
   contents: read
 
 jobs:
-  tests:
+  tests-hosted-linux:
     env:
-      qrshare__shareservice_apikey: "runnertestingpassword"
-      qrshare__shareservice_url: "http://localhost:8082/dl.php"
+      synchronizer-ondemandshareconfig__apikey: "runnertestingpassword"
+      synchronizer-ondemandshareconfig__baseurl: "http://localhost:8082/"
+      synchronizer-ondemandshareconfig__name: "/"
+      synchronizer-ondemandshareconfig__subdir: "tmp/srv_php_endpoint"
       PHP_CLI_SERVER_WORKERS: 6
     runs-on: ubuntu-latest
     continue-on-error: false
     strategy:
       fail-fast: true
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.3"
           ini-values: upload_max_filesize=50M, post_max_size=51M, memory_limit=200M, max_execution_time=180
-      - name: start php built-in server to allow testing shareservice
+      - name: start php built-in server to allow testing shareondemand
         run: |
-          sed -i '0,/changedefault!/s//runnertestingpassword/' extras/shareservice/dl.php
-          nohup php -S localhost:8082 -t extras/shareservice/ > phpd.log 2>&1 &
+          # sed -i '0,/changedefault!/s//runnertestingpassword/' extras/shareondemand/api.php
+          mkdir /tmp/srv_php_endpoint
+          nohup php -S localhost:8082 -t /tmp/srv_php_endpoint/ > phpd.log 2>&1 &
       - name: Set up Python and uv ${{ matrix.python-version }}
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Install system apt dependencies
         run: |
           sudo apt update
-          sudo apt -y install libturbojpeg python3-pip libgl1 git libcap-dev
-          sudo apt -y install ffmpeg
+          sudo apt -y install libturbojpeg0 python3-pip libgl1 git libcap-dev ffmpeg rclone
       - name: install the project
         run: |
           uv sync --all-extras --dev
@@ -52,47 +55,112 @@ jobs:
         if: always()
         run: |
           cat phpd.log || true
-          cat extras/shareservice/php-error.log || true
-      - uses: actions/upload-artifact@v4
+          cat /tmp/srv_php_endpoint/php-error.log || true
+      - uses: actions/upload-artifact@v7
         with:
-          name: coverage-${{ matrix.python-version }}
+          name: coverage-hosted-linux-${{ matrix.python-version }}
+          path: coverage.xml
+
+  tests-hosted-windows:
+    runs-on: windows-latest
+    continue-on-error: false
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python and uv ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      # - name: install system dependencies
+      #   run: |
+      #     choco install rclone
+      #     choco install ffmpeg
+      - name: install the project
+        run: |
+          uv sync --all-extras --dev
+      - name: Run pytest
+        env:
+          COLUMNS: "120" # fix an issue with python 3.14 and latest windows when logging from pynng callback
+          LINES: "40"
+        run: |
+          uv run pytest --basetemp=./tests_tmp/ -v ./src/tests/tests --cov-report=term --cov-report=xml:coverage.xml --cov
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-hosted-windows-${{ matrix.python-version }}
+          path: coverage.xml
+
+  tests-hosted-macos:
+    runs-on: macos-latest
+    continue-on-error: false
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      # - name: Setup FFmpeg
+      #   uses: AnimMouse/setup-ffmpeg@v1
+      #   with: # v8 not yet avail: https://github.com/AnimMouse/setup-ffmpeg/issues/7
+      #     version: 71 # for mac specify without .
+      - name: Set up Python and uv ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      # - name: install system dependencies
+        # run: |
+        #   brew update
+        #   brew install rclone
+      - name: install the project
+        run: |
+          uv sync --all-extras --dev
+      - name: Run pytest
+        run: |
+          uv run pytest --basetemp=./tests_tmp/ -v ./src/tests/tests --cov-report=term --cov-report=xml:coverage.xml --cov
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-hosted-macos-${{ matrix.python-version }}
           path: coverage.xml
 
   tests-hardware-rpi:
     env:
       ## Sets environment variable
-      wled-wled_enabled: True
-      wled-wled_serial_port: /dev/serial/by-id/usb-1a86_USB2.0-Serial-if00-port0
+      wled-common__enabled: True
+      wled-common__serial_port: /dev/serial/by-id/usb-1a86_USB2.0-Ser_-if00-port0
 
       # use system python to allow for picamera2 to import
-      UV_PYTHON: 3.11
+      UV_PYTHON: 3.13
       UV_PYTHON_PREFERENCE: only-system
 
     runs-on: [self-hosted, rpi]
     if: ${{ github.repository_owner == 'photobooth-app' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: uv venv --system-site-packages
-      - run: uv sync # install in-project env
+      - run: uv sync --all-extras --dev # install in-project env
       - name: Test with pytest
         run: |
           uv run pytest --basetemp=./tests_tmp/ -v ./src/tests/tests --cov-report=term --cov-report=xml:coverage.xml --cov
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: coverage-hardware-rpi
+          name: coverage-selfhosted-rpi
           path: ./coverage.xml
 
   upload-to-codecov:
-    needs: [tests, tests-hardware-rpi]
+    needs: [tests-hosted-linux, tests-hardware-rpi, tests-hosted-windows, tests-hosted-macos]
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'photobooth-app' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

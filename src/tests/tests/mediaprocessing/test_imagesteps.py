@@ -7,7 +7,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic_extra_types.color import Color
 
 from photobooth.appconfig import AppConfig
@@ -20,7 +20,7 @@ from photobooth.services.mediaprocessing.steps.image import (
     ImageMountStep,
     PluginFilters,
     PluginFilterStep,
-    RemoveChromakeyStep,
+    RemovebgStep,
     TextStep,
     get_plugin_avail_filters,
     get_plugin_userselectable_filters,
@@ -49,7 +49,7 @@ def test_validate_test_method_same():
     assert img1 is not img2  # imgs are not same
 
     # method 1
-    assert list(img2.getdata()) == list(img1.getdata())
+    assert list(iter(img2.get_flattened_data())) == list(iter(img1.get_flattened_data()))
     # method 2
     assert is_same(img1, img2)
 
@@ -60,7 +60,7 @@ def test_validate_test_method_different():
     assert img1 is not img2  # imgs are not same
 
     # method 1
-    assert list(img2.getdata()) != list(img1.getdata())
+    assert list(iter(img2.get_flattened_data())) != list(iter(img1.get_flattened_data()))
     # method 2
     assert not is_same(img1, img2)
 
@@ -156,21 +156,19 @@ def test_text_stage_empty_emptytext_skips(pil_image: Image.Image):
     assert is_same(pil_image, stage_output)  # but pixel are same because empty textconfig
 
 
-def test_removechromakey_stage(pil_image: Image.Image):
-    keycolor = AppConfig().mediaprocessing.removechromakey_keycolor
-    tolerance = AppConfig().mediaprocessing.removechromakey_tolerance
+def test_rembg_ai_stage(pil_image: Image.Image):
+    ai_model = AppConfig().mediaprocessing.remove_background_model
 
     assert pil_image.mode == "RGB"  # before process it's RGB
 
     context = ImageContext(pil_image)
-    steps = [RemoveChromakeyStep(keycolor, tolerance)]
+    steps = [RemovebgStep(ai_model)]
     pipeline = Pipeline[ImageContext](*steps)
     pipeline(context)
     stage_output = context.image
 
     assert stage_output.mode == "RGBA"  # after process always RGBA
     assert pil_image is not stage_output  # original copied here, so not equal
-    assert is_same(pil_image, stage_output)  # but pixel are same because empty textconfig
 
 
 def test_fill_background_stage(pil_image: Image.Image):
@@ -232,7 +230,7 @@ def test_img_background_stage(pil_image: Image.Image):
     pil_image.putalpha(100)
 
     context = ImageContext(pil_image)
-    steps = [ImageMountStep("./userdata/demoassets/backgrounds/pink-7761356_1920.jpg")]
+    steps = [ImageMountStep("./userdata/demoassets/backgrounds/background.jpg")]
     pipeline = Pipeline[ImageContext](*steps)
     pipeline(context)
     stage_output = context.image
@@ -243,11 +241,10 @@ def test_img_background_stage(pil_image: Image.Image):
 
 
 def test_img_background_stage_rgb_skip_process(pil_image: Image.Image):
-    pil_image = pil_image
     assert pil_image.mode == "RGB"  # before process it's RGB
 
     context = ImageContext(pil_image)
-    steps = [ImageMountStep("./userdata/demoassets/backgrounds/pink-7761356_1920.jpg")]
+    steps = [ImageMountStep("./userdata/demoassets/backgrounds/background.jpg")]
     pipeline = Pipeline[ImageContext](*steps)
     pipeline(context)
     stage_output = context.image
@@ -267,12 +264,20 @@ def test_img_background_stage_nonexistentfile(pil_image: Image.Image):
         pipeline(context)
 
 
-def test_img_background_stage_reverse(pil_image: Image.Image):
+def test_img_background_stage_reverse(pil_image: Image.Image, tmp_path: Path):
+    temp_file = tmp_path / "test_image.png"
+    # Create an RGBA image with a solid background
+    img = Image.new("RGBA", (512, 512), (255, 0, 0, 255))
+
+    # Draw a transparent rectangle directly
+    ImageDraw.Draw(img).rectangle((80, 60, 320, 240), fill=(0, 0, 0, 255))
+    img.save(temp_file)
+
     pil_image = pil_image.convert("RGBA")
     assert pil_image.mode == "RGBA"  # before process it's RGBA
 
     context = ImageContext(pil_image)
-    steps = [ImageMountStep("./src/tests/assets/frames/polaroid-6125402_1pic-transparency.png", reverse=True)]
+    steps = [ImageMountStep(temp_file, reverse=True)]
     pipeline = Pipeline[ImageContext](*steps)
     pipeline(context)
     stage_output = context.image
@@ -282,9 +287,18 @@ def test_img_background_stage_reverse(pil_image: Image.Image):
     assert not is_same(pil_image, stage_output)  # pixel are diff because background shines through
 
 
-def test_img_frame_stage(pil_image: Image.Image):
+def test_img_frame_stage(pil_image: Image.Image, tmp_path: Path):
+    temp_file = tmp_path / "test_image.png"
+
+    # Create an RGBA image with a solid background
+    img = Image.new("RGBA", (512, 512), (255, 0, 0, 255))
+
+    # Draw a transparent rectangle directly
+    ImageDraw.Draw(img).rectangle((80, 60, 320, 240), fill=(0, 0, 0, 0))
+    img.save(temp_file)
+
     context = ImageContext(pil_image)
-    steps = [ImageFrameStep("./src/tests/assets/frames/polaroid-6125402_1pic-transparency.png")]
+    steps = [ImageFrameStep(temp_file)]
     pipeline = Pipeline[ImageContext](*steps)
     pipeline(context)
     stage_output = context.image
@@ -294,19 +308,27 @@ def test_img_frame_stage(pil_image: Image.Image):
     assert not is_same(pil_image, stage_output)  # pixel are diff because capture is mounted
 
 
-def test_img_frame_stage_notransparency_rgbamode(pil_image: Image.Image):
+def test_img_frame_stage_notransparency_rgbamode(pil_image: Image.Image, tmp_path: Path):
+    temp_file = tmp_path / "test_image.png"
+    img_solid = Image.new("RGBA", (512, 512), "red")
+    img_solid.save(temp_file)
+
     with pytest.raises(PipelineError):
         context = ImageContext(pil_image)
-        steps = [ImageFrameStep("./src/tests/assets/frames/polaroid-6125402_1pic-notransparency.png")]
+        steps = [ImageFrameStep(temp_file)]
         pipeline = Pipeline[ImageContext](*steps)
         pipeline(context)
         _ = context.image
 
 
-def test_img_frame_stage_notransparency_rgbmode(pil_image: Image.Image):
+def test_img_frame_stage_notransparency_rgbmode(pil_image: Image.Image, tmp_path: Path):
+    temp_file = tmp_path / "test_image.jpg"
+    img_solid = Image.new("RGB", (512, 512), "red")
+    img_solid.save(temp_file)
+
     with pytest.raises(PipelineError):
         context = ImageContext(pil_image)
-        steps = [ImageFrameStep("./src/tests/assets/frames/polaroid-6125402_1pic.jpg")]
+        steps = [ImageFrameStep(temp_file)]
         pipeline = Pipeline[ImageContext](*steps)
         pipeline(context)
         _ = context.image

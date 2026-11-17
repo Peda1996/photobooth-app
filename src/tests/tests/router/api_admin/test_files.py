@@ -1,6 +1,5 @@
 import os
 import shutil
-from collections.abc import Generator
 from dataclasses import asdict
 from pathlib import Path
 from unittest import mock
@@ -10,25 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from photobooth import RECYCLE_PATH, USERDATA_PATH
-from photobooth.application import app
-from photobooth.container import container
 from photobooth.routers.api_admin.files import PathListItem
-
-
-@pytest.fixture
-def client() -> Generator[TestClient, None, None]:
-    with TestClient(app=app, base_url="http://test/api/") as client:
-        container.start()
-        yield client
-        container.stop()
-
-
-@pytest.fixture
-def client_authenticated(client) -> Generator[TestClient, None, None]:
-    response = client.post("/admin/auth/token", data={"username": "admin", "password": "0000"})
-    token = response.json()["access_token"]
-    client.headers = {"Authorization": f"Bearer {token}"}
-    yield client
 
 
 @pytest.fixture(
@@ -65,12 +46,6 @@ def test_admin_file_endpoints(client_authenticated: TestClient):
     os.remove(".testfile")
 
     assert response.status_code == 200
-
-
-def test_admin_enumerate_files(client_authenticated: TestClient):
-    response = client_authenticated.get("/admin/enumerate/userfiles?q=.")
-    assert response.status_code == 200
-    assert len(response.json()) > 1
 
 
 def test_admin_list_notexists(client_authenticated: TestClient):
@@ -145,13 +120,11 @@ def test_admin_files_upload_internalerror(client_authenticated: TestClient):
             response = client_authenticated.post(
                 "/admin/files/file/upload",
                 data={"upload_target_folder": "./"},
-                files={"uploaded_files": ("testupload_automated.jpg", f, "image/jpeg")},
+                files={"uploaded_files": ("testupload_automated1.jpg", f, "image/jpeg")},
             )
 
-            try:
-                os.unlink("./testupload_automated.jpg")  # fails if file was not created.
-            except Exception:
-                pass
+            # despite mock the file is copied anyways, so we delete it but fail in silence if it
+            os.unlink("./testupload_automated1.jpg")  # fails if file was not created.
 
             assert response.status_code == 500
             assert "detail" in response.json()

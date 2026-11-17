@@ -1,22 +1,11 @@
-from collections.abc import Generator
 from unittest import mock
 from unittest.mock import patch
 
-import pytest
 from fastapi.testclient import TestClient
 
-from photobooth.application import app
 from photobooth.container import container
 from photobooth.database.schemas import MediaitemPublic
 from photobooth.services.collection import MediacollectionService
-
-
-@pytest.fixture
-def client() -> Generator[TestClient, None, None]:
-    with TestClient(app=app, base_url="http://test/api/") as client:
-        container.start()
-        yield client
-        container.stop()
 
 
 def test_get_items(client: TestClient):
@@ -55,7 +44,7 @@ def test_get_item_exception(client: TestClient):
         assert "detail" in response.json()
 
 
-@patch("os.remove")
+@patch("pathlib.Path.unlink")
 def test_delete_item(mock_remove, client: TestClient):
     mediaitem = container.mediacollection_service.get_item_latest()
 
@@ -67,7 +56,7 @@ def test_delete_item(mock_remove, client: TestClient):
     mock_remove.assert_called()
 
 
-@patch("os.remove")
+@patch("pathlib.Path.unlink")
 def test_delete_items(mock_remove, client: TestClient):
     response = client.delete("/mediacollection/")
 

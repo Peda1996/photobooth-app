@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, SerializationInfo, field_serializer
 
+from ..serializer import contextual_serializer_password
+
 
 class GroupCommon(BaseModel):
     """Common config for photobooth."""
@@ -16,15 +18,12 @@ class GroupCommon(BaseModel):
     admin_password: SecretStr = Field(
         default=SecretStr("0000"),
         description="Password to access the admin dashboard.",
+        min_length=4,
     )
 
     @field_serializer("admin_password")
     def contextual_serializer(self, value, info: SerializationInfo):
-        if info.context:
-            if info.context.get("secrets_is_allowed", False):
-                return value.get_secret_value()
-
-        return "************"
+        return contextual_serializer_password(value, info)
 
     logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="DEBUG",

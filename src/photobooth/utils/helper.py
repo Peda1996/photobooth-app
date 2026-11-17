@@ -5,31 +5,32 @@ Utilities
 import logging
 import os
 import platform
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def filenames_sanitize(path: Path | str, basepath: Path = Path.cwd()) -> Path:
-    """turn strings in paths and sanitize. Used for userinput to check the path is below CWD.
-
-    Args:
-        filenames (list[str]): _description_
-
-    Raises:
-        ValueError: _description_
+def filename_str_time() -> str:
+    """whenever somewhere a filename needs to be generated, rely on this function. it gives "almost" unique filenames
+    that reflect time history so later users can review captures easily and it's sorted by time.
 
     Returns:
-        list[Path]: _description_
+        str: _description_
     """
-    path_str = str(path)
-    basepath_str = str(basepath)
-    fullpath = os.path.normpath(os.path.join(basepath_str, path_str))
+    return datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
 
-    if not fullpath.startswith(basepath_str):
-        raise ValueError(f"illegal file requested: {fullpath}")
 
-    return Path(fullpath)
+def filenames_sanitize(path: Path | str, basepath: Path = Path.cwd()) -> Path:
+    """turn strings in paths and sanitize. Used for userinput to check the path is below CWD."""
+
+    base = basepath.resolve()
+    fullpath = (base / path).resolve()
+
+    if not fullpath.is_relative_to(base):
+        raise ValueError(f"illegal file requested: {fullpath} using basepath {base}")
+
+    return fullpath
 
 
 def is_rpi():

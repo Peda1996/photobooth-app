@@ -5,6 +5,8 @@ from fastapi import APIRouter, HTTPException, status
 
 from ...container import container
 from ...database.models import Mediaitem
+from ...plugins import pm as pluggy_pm
+from ...utils.exceptions import WrongMediaTypeError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/share", tags=["share"])
@@ -13,12 +15,8 @@ router = APIRouter(prefix="/share", tags=["share"])
 def _share(mediaitem: Mediaitem, index: int, parameters: dict[str, str] | None):
     try:
         container.share_service.share(mediaitem, index, parameters)
-    except BlockingIOError:
+    except (BlockingIOError, ConnectionRefusedError, WrongMediaTypeError):
         pass  # informed by sepearate sse event
-    except ConnectionRefusedError:
-        pass  # informed by sepearate sse event
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Something went wrong, Exception: {exc}") from exc
     except Exception as exc:
         logger.exception(exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Something went wrong, Exception: {exc}") from exc
@@ -42,3 +40,16 @@ def api_share_item_id(id: UUID, index: int = 0, parameters: dict[str, str] | Non
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {exc}") from exc
     _share(requested_mediaitem, index, parameters)
+
+
+@router.get("/download/{id}")
+def api_download_item_id_get_sharelinks(id: UUID):  # -> list[str]:
+    try:
+        requested_mediaitem = container.mediacollection_service.get_item(id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {exc}") from exc
+
+    pluggy_links = pluggy_pm.hook.get_share_links(filepath_local=requested_mediaitem.processed, identifier=requested_mediaitem.id)
+    pluggy_links_flatten = [x for xs in pluggy_links for x in xs]
+
+    return pluggy_links_flatten

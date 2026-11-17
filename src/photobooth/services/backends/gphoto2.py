@@ -1,343 +1,329 @@
-"""
-Gphoto2 backend implementation
-
-"""
-
 import logging
 import os
 import time
+from enum import Enum
 from pathlib import Path
-from threading import Condition, Event
+from tempfile import NamedTemporaryFile
 
-try:
-    import gphoto2 as gp  # type: ignore
-except ImportError:
-    gp = None
+import gphoto2 as gp
 
-
-from ...utils.stoppablethread import StoppableThread
-from ..config.groups.backends import GroupBackendGphoto2
-from .abstractbackend import AbstractBackend, GeneralBytesResult, GeneralFileResult
+from ...utils.helper import filename_str_time
+from ..config.groups.cameras import Gphoto2Parameters, GroupCameraGphoto2
+from .abstractbackend import AbstractBackend, StillRequest
 
 logger = logging.getLogger(__name__)
 
 
+class GpWidgets(Enum):
+    GP_WIDGET_WINDOW = 0
+    GP_WIDGET_SECTION = 1
+    GP_WIDGET_TEXT = 2
+    GP_WIDGET_RANGE = 3
+    GP_WIDGET_TOGGLE = 4
+    GP_WIDGET_RADIO = 5
+    GP_WIDGET_MENU = 6
+    GP_WIDGET_BUTTON = 7
+    GP_WIDGET_DATE = 8
+
+
+# generate dict for clear events clear text names
+# defined events http://www.gphoto.org/doc/api/gphoto2-camera_8h.html#a438ab2ac60ad5d5ced30e4201476800b (docs outdated!)
+class GpEvents(Enum):
+    GP_EVENT_UNKNOWN = 0
+    GP_EVENT_TIMEOUT = 1
+    GP_EVENT_FILE_ADDED = 2
+    GP_EVENT_FOLDER_ADDED = 3
+    GP_EVENT_CAPTURE_COMPLETE = 4
+    GP_EVENT_FILE_CHANGED = 5
+
+
+# assert to ensure our definition is always the same as in libgphoto
+assert {e.name: e.value for e in GpWidgets} == {name: getattr(gp, name) for name in GpWidgets.__members__}, "GP_WIDGET are inconsistent"
+assert {e.name: e.value for e in GpEvents} == {name: getattr(gp, name) for name in GpEvents.__members__}, "GP_EVENT are inconsistent"
+
+
 class Gphoto2Backend(AbstractBackend):
-    def __init__(self, config: GroupBackendGphoto2):
-        self._config: GroupBackendGphoto2 = config
-        super().__init__(orientation=config.orientation)
+    def __init__(self, config: GroupCameraGphoto2):
+        self._config: GroupCameraGphoto2 = config
+        super().__init__(
+            config.orientation,
+            num_subdevices=1,
+            idle_timeout=self._config.camera_standby_when_inactive_time if self._config.camera_standby_when_inactive else None,
+        )
 
         if gp is None:
             raise ModuleNotFoundError("Backend is not available - either wrong platform or not installed!")
 
-        self._camera = gp.Camera()  # pyright: ignore [reportAttributeAccessIssue]
-        self._camera_context = gp.Context()  # pyright: ignore [reportAttributeAccessIssue]
-
-        # if True signal to switch optimized, set none after switch again.
-        self._configure_optimized_for_hq_capture_flag = None
-        self._configure_optimized_for_idle_video_flag = None
-
-        # generate dict for clear events clear text names
-        # defined events http://www.gphoto.org/doc/api/gphoto2-camera_8h.html#a438ab2ac60ad5d5ced30e4201476800b
-        self.event_texts = {}
-        for name in (
-            "GP_EVENT_UNKNOWN",
-            "GP_EVENT_TIMEOUT",
-            "GP_EVENT_FILE_ADDED",
-            "GP_EVENT_FOLDER_ADDED",
-            "GP_EVENT_CAPTURE_COMPLETE",
-            "GP_EVENT_FILE_CHANGED",
-        ):
-            self.event_texts[getattr(gp, name)] = name
-
-        self._hires_data: GeneralFileResult = GeneralFileResult(filepath=None, request=Event(), condition=Condition())
-        self._lores_data: GeneralBytesResult = GeneralBytesResult(data=b"", condition=Condition())
-        self._worker_thread: StoppableThread | None = None
+        self._camera = gp.Camera()  # pyrefly: ignore [missing-attribute]
+        self._camera_context = gp.Context()
 
         logger.info(f"python-gphoto2: {gp.__version__}")
-        logger.info(f"libgphoto2: {gp.gp_library_version(gp.GP_VERSION_VERBOSE)}")  # pyright: ignore [reportAttributeAccessIssue]
-        logger.info(f"libgphoto2_port: {gp.gp_port_library_version(gp.GP_VERSION_VERBOSE)}")  # pyright: ignore [reportAttributeAccessIssue]
+        logger.info(f"libgphoto2: {gp.gp_library_version(gp.GP_VERSION_VERBOSE)}")  # pyrefly: ignore [missing-attribute]
+        logger.info(f"libgphoto2_port: {gp.gp_port_library_version(gp.GP_VERSION_VERBOSE)}")  # pyrefly: ignore [missing-attribute]
 
         # enable logging to python. need to store callback, otherwise logging does not work.
         # gphoto2 logging is too verbose, reduce mapping
         self._logger_callback = gp.check_result(
             gp.use_python_logging(
                 mapping={
-                    gp.GP_LOG_ERROR: logging.INFO,  # pyright: ignore [reportAttributeAccessIssue]
-                    gp.GP_LOG_DEBUG: logging.DEBUG - 1,  # pyright: ignore [reportAttributeAccessIssue]
-                    gp.GP_LOG_VERBOSE: logging.DEBUG - 3,  # pyright: ignore [reportAttributeAccessIssue]
-                    gp.GP_LOG_DATA: logging.DEBUG - 6,  # pyright: ignore [reportAttributeAccessIssue]
+                    gp.GP_LOG_ERROR: logging.INFO,  # pyrefly: ignore [missing-attribute]
+                    gp.GP_LOG_DEBUG: logging.DEBUG - 1,  # pyrefly: ignore [missing-attribute]
+                    gp.GP_LOG_VERBOSE: logging.DEBUG - 3,  # pyrefly: ignore [missing-attribute]
+                    gp.GP_LOG_DATA: logging.DEBUG - 6,  # pyrefly: ignore [missing-attribute]
                 }
             )
         )
 
     def start(self):
         super().start()
-        assert gp
-
-        # try open cam. if fails it raises an exception and the supvervisor tries to restart.
-        # better use fresh object.
-        self._camera = gp.Camera()  # pyright: ignore [reportAttributeAccessIssue]
-        self._camera.init()  # if init was success, the backend is ready to deliver, no additional later checks needed.
-
-        try:
-            logger.info(str(self._camera.get_summary()))
-        except gp.GPhoto2Error as exc:
-            logger.error(f"could not get camera information, error {exc}")
-
-        self._set_config("capturetarget", self._config.gcapture_target)
-
-        self._worker_thread = StoppableThread(name="gphoto2_worker_thread", target=self._worker_fun, daemon=True)
-        self._worker_thread.start()
-
-        logger.debug(f"{self.__module__} started")
 
     def stop(self):
         super().stop()
 
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.stop()
-            self._worker_thread.join()
+    def _handle_switchmode_init(self):
+        logger.debug("configure camera during device init")
+        self._handle_switchmode(self._config.parameterset_device_init)
 
+    def _handle_switchmode_video_mode(self):
+        logger.debug("configure camera optimized for video")
+        self._handle_switchmode(self._config.parameterset_video)
+
+    def _handle_switchmode_still_mode(self):
+        logger.debug("configure camera optimized for still capture")
+        self._handle_switchmode(self._config.parameterset_still)
+
+    def _handle_switchmode_standby(self):
+        logger.debug("configure camera optimized for standby")
+        self._handle_switchmode(self._config.parameterset_standby)
+
+    def _handle_switchmode(self, parameterset: list[Gphoto2Parameters]) -> None:
+        camera_config = self._camera.get_config()
+
+        for cfg in parameterset:
+            if cfg.enabled:
+                try:
+                    self._update_camera_config(camera_config, cfg.name, cfg.value)
+                except Exception as exc:
+                    logger.warning(f"Error setting config: {exc}. It will be ignored.")
+
+        self._camera.set_config(camera_config)  # ... and write all at once to camera
+
+    def _update_camera_config(self, camera_config, name: str, value_new: str | int | bool | float):
+        assert gp
+
+        if name == "" or value_new == "":
+            raise ValueError(f"setting is missing name '{name}' or value '{value_new}'")
+
+        child = camera_config.get_child_by_name(name)
+        is_readonly = child.get_readonly()
+        typ = child.get_type()
+        name = child.get_name()
+        value_old = child.get_value()
+
+        if is_readonly:
+            raise PermissionError(f"'{name}' is readonly!")
+
+        # update configuration object and properly cast the new value
+        config_type = GpWidgets(typ)
+        if config_type is GpWidgets.GP_WIDGET_TEXT:
+            value_new_casted = str(value_new)
+        elif config_type in (GpWidgets.GP_WIDGET_RADIO, GpWidgets.GP_WIDGET_MENU):
+            # radio/menu widgets allow only specific values, so it allows to validate the user provided data before it's sent
+            # to the camera and breaks everything. The available choices reported by the camera may differ by the selected mode
+            available_choices = [choice for choice in child.get_choices()]
+
+            if value_new not in available_choices:
+                raise ValueError(f"{value_new} is not an option for '{name}' in current mode. Available choices are {available_choices}")
+
+            value_new_casted = str(value_new)
+        elif config_type is GpWidgets.GP_WIDGET_TOGGLE:
+            value_new_casted = 1 if str(value_new).lower() in ("true", "1") else 0
+        else:
+            raise RuntimeError(f"The app does not support the setting's type '{config_type}' for {child.get_name()}")
+
+        try:
+            child.set_value(value_new_casted)  # update the python object ...
+            logger.debug(f"Camera setting '{name}' changed from '{value_old}' to '{value_new}' ({value_new_casted})")
+        except Exception as exc:
+            logger.exception(exc)
+            raise RuntimeError(f"Cannot set '{name}' to '{value_new}'! Command ignored. Error: {exc}") from exc
+
+    def setup_resource(self):
+        assert gp
+
+        # try open cam. if fails it raises an exception and the supvervisor tries to restart.
+        # better use fresh object.
+        self._camera = gp.Camera()  # pyrefly: ignore [missing-attribute]
+        try:
+            self._camera.init()  # if init was success, the backend is ready to deliver, no additional later checks needed.
+        except gp.GPhoto2Error as exc:
+            # logger.error(f"could not get camera information, error {exc}")
+            logger.debug("error occured, please check https://photobooth-app.org/help/faq/#gphoto2-camera-found-but-no-access for troubleshooting.")
+            raise ConnectionError(f"Could not connect to camera, error: {exc}") from exc
+
+    def display_config(self, camera_config):
+        for child in camera_config:
+            # label = f"{child.get_label()} ({child.get_name()}=({child.get_value()}))"
+            if GpWidgets(child.get_type()) == GpWidgets.GP_WIDGET_SECTION:
+                print("\n\n- SECTION: ", end="")
+                print(f"{child.get_label()} ({child.get_name()})")
+
+                self.display_config(child)
+            else:
+                print(f"{child.get_name()}='{child.get_value()}'   {child.get_label()}   {' (readonly) ' if child.get_readonly() else ''}  ")
+                print(f"type={GpWidgets(child.get_type()).name}")
+                if GpWidgets(child.get_type()) in (GpWidgets.GP_WIDGET_RADIO, GpWidgets.GP_WIDGET_MENU):
+                    print(f"available options {{index, value}} are {[{idx: choice} for idx, choice in enumerate(child.get_choices())]}")
+                print()
+
+    def teardown_resource(self):
         if self._camera:
             self._camera.exit()
 
-        logger.debug(f"{self.__module__} stopped")
-
-    def _device_alive(self) -> bool:
-        super_alive = super()._device_alive()
-        worker_alive = bool(self._worker_thread and self._worker_thread.is_alive())
-
-        return super_alive and worker_alive
-
-    def _wait_for_multicam_files(self) -> list[Path]:
-        raise NotImplementedError("backend does not support multicam files")
-
-    def _wait_for_still_file(self) -> Path:
-        """
-        for other threads to receive a hq JPEG image
-        mode switches are handled internally automatically, no separate trigger necessary
-        this function blocks until frame is received
-        raise TimeoutError if no frame was received
-        """
-        with self._hires_data.condition:
-            self._hires_data.request.set()
-
-            if not self._hires_data.condition.wait(timeout=8):
-                self._hires_data.request.clear()  # clear hq request even if failed, parent class might retry again
-                raise TimeoutError("timeout receiving frames")
-
-            assert self._hires_data.filepath
-
-            return self._hires_data.filepath
-
-    def _wait_for_lores_image(self):
-        """for other threads to receive a lores JPEG image"""
-        flag_logmsg_emitted_once = False
-        while self._hires_data.request.is_set():
-            if not flag_logmsg_emitted_once:
-                logger.debug("request to _wait_for_lores_image waiting until ongoing request_hires_still is finished")
-                flag_logmsg_emitted_once = True  # avoid flooding logs
-
-            time.sleep(0.2)
-
-        with self._lores_data.condition:
-            if not self._lores_data.condition.wait(timeout=0.5):
-                raise TimeoutError("timeout receiving frames")
-
-            return self._lores_data.data
-
-    def _on_configure_optimized_for_idle(self):
-        # idle and hq_preview are same settings for this backend.
-        self._configure_optimized_for_idle_video_flag = True
-
-    def _on_configure_optimized_for_hq_preview(self):
-        # idle and hq_preview are same settings for this backend.
-        self._configure_optimized_for_idle_video_flag = True
-
-    def _on_configure_optimized_for_hq_capture(self):
-        self._configure_optimized_for_hq_capture_flag = True
-
-    def _configure_optimized_for_hq_capture(self):
-        if self._configure_optimized_for_hq_capture_flag:
-            logger.debug("configure camera optimized for still capture")
-            self._configure_optimized_for_hq_capture_flag = None
-
-            self._set_config("iso", self._config.iso_capture)
-            self._set_config("shutter_speed", self._config.shutter_speed_capture)
-
-            if self._config.canon_eosmoviemode:
-                self._set_config("eosmoviemode", 0)
-
-            # disable viewfinder;
-            # allows camera to autofocus fast in native mode not contrast mode
-            if self._config.disable_viewfinder_before_capture:
-                logger.info("disable viewfinder before capture")
-                self._set_config("viewfinder", 0)
-
-    def _configure_optimized_for_idle_video(self):
-        if self._configure_optimized_for_idle_video_flag:
-            logger.debug("configure camera optimized for idle/video")
-            self._configure_optimized_for_idle_video_flag = None
-
-            self._set_config("iso", self._config.iso_liveview)
-            self._set_config("shutter_speed", self._config.shutter_speed_liveview)
-
-            if self._config.canon_eosmoviemode:
-                self._set_config("eosmoviemode", 1)
-
-    def _set_config(self, field: str, val: str | int = ""):
-        assert gp
-
-        if val == "":  # 0 is not considered empty, so its not "not val"
-            logger.debug(f"{field} value empty, ignore")
-            return
-        try:
-            logger.info(f"setting custom {field} to {val}")
-            self._gp_set_config(field, val)
-        except gp.GPhoto2Error as exc:
-            logger.warning(f"cannot set {field} to {val}, command ignored {exc}")
-
-    def _gp_set_config(self, name, val):
-        config = self._camera.get_config(self._camera_context)
-        node = config.get_child_by_name(name)
-        node.set_value(val)
-        self._camera.set_config(config, self._camera_context)
-
-    #
-    # INTERNAL IMAGE GENERATOR
-    #
-
-    def _worker_fun(self):
-        assert self._worker_thread
+    def run_service(self):
         assert gp
 
         preview_failcounter = 0
 
-        self._device_set_is_ready_to_deliver()
+        while not self._stop_event.is_set():  # repeat until stopped
+            with self._hires_lock:
+                req = self._hires_queue.popleft() if self._hires_queue else None
 
-        while not self._worker_thread.stopped():  # repeat until stopped
-            if not self._hires_data.request.is_set():
-                if self._device_enable_lores_flag:
-                    # check if flag is true and configure if so once.
-                    self._configure_optimized_for_idle_video()
+            if req:
+                if isinstance(req, StillRequest):
+                    # capture hq picture
+                    logger.info("taking hq picture")
 
-                    try:
-                        capture = self._camera.capture_preview()
+                    # hold a list of captured files during capture. this is needed if JPG+RAW is shot.
+                    # there is no guarantee that the first is the JPG and second the RAW image. Also depending on the capturetarget
+                    # the sequence the images appear can be different. gp.GP_CAPTURE_IMAGE vs gp.GP_CAPTURE_RAW seems not reliable to rely on
+                    captured_files: list[tuple[str, str]] = []
 
-                    except Exception as exc:
-                        preview_failcounter += 1
+                    with self._mode_machine.ext_mode_switch_lock:
+                        # we force the camera to still mode and do not allow to change the mode until it is completed.
+                        # otherwise the app could request
+                        self._mode_machine.process_switchmode("still")
 
-                        if preview_failcounter <= 10:
-                            logger.warning(f"error capturing frame from DSLR: {exc}")
-                            # abort this loop iteration and continue sleeping...
-                            time.sleep(0.5)  # add another delay to avoid flooding logs
+                        try:
+                            self._camera.trigger_capture()
+                        except gp.GPhoto2Error as exc:
+                            logger.critical(f"error capture! check logs for errors. {exc}")
 
+                            # try again in next loop
+                            time.sleep(0.6)  # if it fails before next round, wait little because it might fail fast again
                             continue
-                        else:
-                            logger.critical(f"aborting capturing frame, camera disconnected? retry to connect {exc}")
-                            try:
-                                self._camera.exit()
-                            except Exception as exc:
-                                pass  # fail in silence, because things got already wrong. this one is just to try to cleanup, might help or not...
 
-                            # stop device requested by leaving worker loop, so supvervisor can restart
+                    # empty the event queue, needed in case of RAW+JPG shooting usually.
+                    # used usually only if capture JPG+RAW enabled (2 files added in one capture)
+                    # if not cleared, the second capture might fail due to pending events in libgphoto2
+                    # also if raw, we might have the JPG added later in these events, not received from .capture above
+                    # https://github.com/jim-easterbrook/python-gphoto2/issues/65#issuecomment-433615025
+                    while True:
+                        evt_typ_cam, evt_data_cam = self._camera.wait_for_event(2000)
+                        evt_typ = GpEvents(evt_typ_cam)
+
+                        if evt_typ in (GpEvents.GP_EVENT_CAPTURE_COMPLETE, GpEvents.GP_EVENT_TIMEOUT):
+                            logger.debug(f"Event '{evt_typ.name}' received, capture is complete, continue to download capture.")
                             break
-                    else:
-                        preview_failcounter = 0
+                        elif evt_typ is GpEvents.GP_EVENT_FILE_ADDED:
+                            logger.debug(f"Event '{evt_typ.name}' received', event data is '{evt_data_cam}'")
+                            captured_files.append((evt_data_cam.folder, evt_data_cam.name))
+                        else:
+                            logger.debug(f"Event '{evt_typ.name}' received', event data is '{evt_data_cam}'")
 
-                    img_bytes = memoryview(capture.get_data_and_size()).tobytes()
+                    logger.info(f"got {captured_files=}")
 
-                    with self._lores_data.condition:
-                        self._lores_data.data = img_bytes
-                        self._lores_data.condition.notify_all()
+                    # now decide which file to download, we watch out for the jpg
+                    file_to_download = None
+                    for captured_file in captured_files:
+                        _, file_extension = os.path.splitext(captured_file[1])  # get file extension (including .)
+                        if file_extension.lower() in (".jpg", ".jpeg"):
+                            file_to_download = captured_file
 
-                    self._frame_tick()
+                            logger.info(f"determined {file_to_download=}")
+                            break
 
-                    # Pi5 seems too fast for the old fashioned gphoto lib, permanently producing
-                    # (ptp_usb_getresp [usb.c:516]) PTP_OC 0x9153 receiving resp failed: Camera Not Ready (0xa102) (port_log.py:20)
-                    # in the logs. to avoid that, we just sleep a bit here effectively frame limiting and
-                    # giving gphoto2 time to settle and avoid flooded logs.
-                    time.sleep(0.04)
+                    # check if a file was found. if no, maybe capture failed or
+                    if file_to_download is None:
+                        logger.critical("no capture or no jpeg captured! shooting in raw-only mode?")
+
+                        # try again in next loop
+                        time.sleep(0.6)  # if it fails before next round, wait little because it might fail fast again
+                        continue
+
+                    # read from camera
+                    try:
+                        # only capture one pic and return to lores streaming afterwards
+                        filepath = Path(
+                            NamedTemporaryFile(
+                                mode="wb",
+                                delete=False,
+                                dir="tmp",
+                                prefix=f"{filename_str_time()}_gphoto2_",
+                                suffix=".jpg",
+                            ).name
+                        )
+
+                        camera_file = self._camera.file_get(file_to_download[0], file_to_download[1], gp.GP_FILE_TYPE_NORMAL)  # pyrefly: ignore [missing-attribute]
+                        camera_file.save(str(filepath))
+
+                    except gp.GPhoto2Error as exc:
+                        logger.critical(f"error reading camera file! check logs for errors. {exc}")
+
+                        # try again in next loop
+                        time.sleep(0.6)  # if it fails before next round, wait little because it might fail fast again
+                        continue
+
+                    with req.condition:
+                        req.result_file = filepath
+                        req.condition.notify_all()
+
+                    if not self.is_video_backend and self._config.camera_standby_when_inactive:
+                        self._mode_machine.request_standby_if_not_video_requested()
                 else:
-                    time.sleep(0.05)
+                    logger.warning(f"this backend does not support {type(req)} requests")
+                    continue
             else:
-                # hold a list of captured files during capture. this is needed if JPG+RAW is shot.
-                # there is no guarantee that the first is the JPG and second the RAW image. Also depending on the capturetarget
-                # the sequence the images appear can be different. gp.GP_CAPTURE_IMAGE vs gp.GP_CAPTURE_RAW seems not reliable to rely on
-                captured_files: list[tuple[str, str]] = []
+                # lores/preview stream
 
-                # check if flag is true and configure if so once.
-                self._configure_optimized_for_hq_capture()
+                self._mode_machine.process_switchmode()
 
-                # capture hq picture
-                logger.info("taking hq picture")
+                if self._mode_machine.active_mode != "video":
+                    time.sleep(0.2)
+                    continue
+
+                # Pi5 seems too fast for the old fashioned gphoto lib, permanently producing
+                # (ptp_usb_getresp [usb.c:516]) PTP_OC 0x9153 receiving resp failed: Camera Not Ready (0xa102) (port_log.py:20)
+                # in the logs. to avoid that, we just sleep a bit here effectively frame limiting and
+                # giving gphoto2 time to settle and avoid flooded logs.
+                self._framerate.wait_until_fps(25)
+
                 try:
-                    file_path = self._camera.capture(gp.GP_CAPTURE_IMAGE)  # pyright: ignore [reportAttributeAccessIssue]
-                    captured_files.append((file_path.folder, file_path.name))
-                except gp.GPhoto2Error as exc:
-                    logger.critical(f"error capture! check logs for errors. {exc}")
+                    camera_file = self._camera.capture_preview()
+                    self._frame_tick()
+                    img_bytes = memoryview(camera_file.get_data_and_size()).tobytes()
 
-                    # try again in next loop
-                    time.sleep(0.6)  # if it fails before next round, wait little because it might fail fast again
-                    continue
+                    with self._lores_data[0].condition:
+                        self._lores_data[0].data = img_bytes
+                        self._lores_data[0].condition.notify_all()
 
-                # empty the event queue, needed in case of RAW+JPG shooting usually.
-                # used usually only if capture JPG+RAW enabled (2 files added in one capture)
-                # if not cleared, the second capture might fail due to pending events in libgphoto2
-                # also if raw, we might have the JPG added later in these events, not received from .capture above
-                # https://github.com/jim-easterbrook/python-gphoto2/issues/65#issuecomment-433615025
-                evt_typ, evt_data = self._camera.wait_for_event(200)
-                while evt_typ != gp.GP_EVENT_TIMEOUT:  # pyright: ignore [reportAttributeAccessIssue]
-                    logger.debug(f"Event: {self.event_texts.get(evt_typ, f'unknown event index: {evt_typ}')}, data: {evt_data}")
+                except Exception as exc:
+                    preview_failcounter += 1
 
-                    if evt_typ == gp.GP_EVENT_FILE_ADDED:  # pyright: ignore [reportAttributeAccessIssue]
-                        captured_files.append((evt_data.folder, evt_data.name))
+                    if preview_failcounter <= 10:
+                        logger.warning(f"error capturing frame from DSLR: {exc}")
+                        # abort this loop iteration and continue sleeping...
+                        time.sleep(0.5)  # add another delay to avoid flooding logs
 
-                    # try to grab another event
-                    evt_typ, evt_data = self._camera.wait_for_event(10)  # timeout in ms
+                        continue
+                    else:
+                        logger.critical(f"aborting capturing frame, camera disconnected? retry to connect {exc}")
+                        try:
+                            self._camera.exit()
+                        except Exception:
+                            pass  # fail in silence, because things got already wrong. this one is just to try to cleanup, might help or not...
 
-                logger.info(f"got {captured_files=}")
-
-                # now decide which file to download, we watch out for the jpg
-                file_to_download = None
-                for captured_file in captured_files:
-                    _, file_extension = os.path.splitext(captured_file[1])  # get file extension (including .)
-                    if str(file_extension).lower() in (".jpg", ".jpeg"):
-                        file_to_download = captured_file
-
-                        logger.info(f"determined {file_to_download=}")
-                        break
-
-                # check if a file was found. if no, maybe capture failed or
-                if file_to_download is None:
-                    logger.critical("no capture or no jpeg captured! shooting in raw-only mode?")
-
-                    # try again in next loop
-                    time.sleep(0.6)  # if it fails before next round, wait little because it might fail fast again
-                    continue
-
-                # read from camera
-                try:
-                    camera_file = self._camera.file_get(file_to_download[0], file_to_download[1], gp.GP_FILE_TYPE_NORMAL)  # pyright: ignore [reportAttributeAccessIssue]
-                    filepath = Path("tmp", f"gphoto2_{file_to_download[1]}")
-                    camera_file.save(str(filepath))
-
-                except gp.GPhoto2Error as exc:
-                    logger.critical(f"error reading camera file! check logs for errors. {exc}")
-
-                    # try again in next loop
-                    time.sleep(0.6)  # if it fails before next round, wait little because it might fail fast again
-                    continue
-
-                # only capture one pic and return to lores streaming afterwards
-                # it's okay to clear in the end because wait_for_hires is taking care about resetting due to timeout also.
-                # changed here first #3cd344796044cd6837c0b5337d96bec7dc1e6b4d
-                self._hires_data.request.clear()
-
-                with self._hires_data.condition:
-                    self._hires_data.filepath = filepath
-                    self._hires_data.condition.notify_all()
-
-        self._device_set_is_ready_to_deliver(False)
-        logger.warning("_worker_fun exits")
+                        # stop device requested by leaving worker loop, so supvervisor can restart
+                        raise RuntimeError(f"Error communicating with the camera: {exc}") from exc
+                else:
+                    preview_failcounter = 0

@@ -18,7 +18,11 @@ ErrorHandler = Callable[[Exception, Context, NextStep], None]
 
 class PipelineStep(Generic[Context]):
     @abstractmethod
-    def __call__(self, context: Context, next_step: NextStep) -> None: ...
+    def __call__(self, context: Context, next_step: NextStep) -> None:
+        pass
+
+    def __repr__(self) -> str:
+        return self.__class__.__name__
 
 
 def _default_error_handler(error: Exception, context: Any, next_step: NextStep) -> None:

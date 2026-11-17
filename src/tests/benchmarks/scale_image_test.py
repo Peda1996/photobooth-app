@@ -1,92 +1,43 @@
 import io
 import logging
 from collections.abc import Generator
-from subprocess import PIPE, Popen
 
 import cv2
 import numpy
 import pytest
-import pyvips
 from PIL import Image
-from simplejpeg import decode_jpeg, encode_jpeg
-from turbojpeg import TurboJPEG
+from simplejpeg import decode_jpeg, decode_jpeg_header, encode_jpeg
+from turbojpeg import TJFLAG_FASTDCT, TurboJPEG
 
 turbojpeg = TurboJPEG()
 logger = logging.getLogger(name=None)
 
 
-def ffmpeg_scale(jpeg_bytes, tmp_path):
-    ffmpeg_subprocess = Popen(
-        [
-            "ffmpeg",
-            "-y",  # overwrite with no questions
-            "-f",  # force input or output format
-            "image2pipe",
-            "-i",
-            "-",
-            "-vf",
-            "scale='iw/2:ih/2'",  # bicubic
-            str(tmp_path / "ffmpeg_scale.jpg"),  # https://docs.python.org/3/library/pathlib.html#operators
-        ],
-        stdin=PIPE,
-    )
-    assert ffmpeg_subprocess.stdin
-    ffmpeg_subprocess.stdin.write(jpeg_bytes)
-    ffmpeg_subprocess.stdin.close()
-    code = ffmpeg_subprocess.wait()
-    if code != 0:
-        raise AssertionError("process fail")
-
-
-def pyvips_scale(jpeg_bytes, tmp_path):
-    # mute some other logger, by raising their debug level to INFO
-    lgr = logging.getLogger(name="pyvips")
-    lgr.setLevel(logging.WARNING)
-    lgr.propagate = True
-
-    image = pyvips.Image.new_from_buffer(jpeg_bytes, "")
-
-    out: pyvips.Image = image.thumbnail_image(  # type: ignore
-        int(image.width / 2),  # width # type: ignore
-    )
-    bytes = out.jpegsave_buffer(Q=85)  # type: ignore
-
-    return bytes
-
-
-def pyvips_resize_scale(jpeg_bytes, tmp_path):
-    # mute some other logger, by raising their debug level to INFO
-    lgr = logging.getLogger(name="pyvips")
-    lgr.setLevel(logging.WARNING)
-    lgr.propagate = True
-
-    image = pyvips.Image.new_from_buffer(jpeg_bytes, "")
-    out: pyvips.Image = image.resize(0.5)  # type: ignore
-    bytes = out.jpegsave_buffer(Q=85)  # type: ignore
-    # im = Image.open(io.BytesIO(bytes))
-    # im.show()
-
-    return bytes
-
-
 def simplejpeg_scale(jpeg_bytes, tmp_path):
-    # Decode with downscaling by a factor of 2 (image size reduced by half)
-    min_height = 500
-    decoded_img = decode_jpeg(jpeg_bytes, min_height=min_height, min_factor=1.5)
-    _ = encode_jpeg(
+    # 1. Get original dimensions without full decoding
+    height, width, _, _ = decode_jpeg_header(jpeg_bytes)
+
+    # 2. Calculate target dimensions for 50% reduction
+    # simplejpeg will pick the closest fast scaling factor (1/2, 1/4, 1/8)
+    target_height = int(height) // 2
+    target_width = int(width) // 2
+    decoded_img = decode_jpeg(jpeg_bytes, min_height=target_height, min_width=target_width, fastdct=True)  # half the height of original
+    bytes = encode_jpeg(
         decoded_img,
         quality=85,
         fastdct=True,
     )
-    return bytes
+    with open(tmp_path / "simplejpeg.jpg", "wb") as file:
+        file.write(bytes)
 
 
 def turbojpeg_scale(jpeg_bytes, tmp_path):
     # encoding BGR array to output.jpg with default settings.
     # 85=default quality
-    bytes = turbojpeg.scale_with_quality(jpeg_bytes, quality=85, scaling_factor=(1, 2))
+    bytes = turbojpeg.scale_with_quality(jpeg_bytes, quality=85, scaling_factor=(1, 2), flags=TJFLAG_FASTDCT)
 
-    return bytes
+    with open(tmp_path / "turbojpeg.jpg", "wb") as file:
+        file.write(bytes)
 
 
 def pillow_scale(jpeg_bytes, tmp_path):
@@ -100,20 +51,22 @@ def pillow_scale(jpeg_bytes, tmp_path):
     height = int(image.height * scale_percent / 100)
     dim = (width, height)
     # https://pillow.readthedocs.io/en/latest/handbook/concepts.html#filters-comparison-table
-    image.thumbnail(dim, Image.Resampling.BICUBIC)  # bicubic for comparison
+    image.thumbnail(dim, Image.Resampling.NEAREST)  # bicubic for comparison
 
     # encode to jpeg again
     byte_io = io.BytesIO()
     image.save(byte_io, format="JPEG", quality=85)
-    bytes_full = byte_io.getbuffer()
+    bytes = byte_io.getbuffer()
 
-    return bytes_full
+    with open(tmp_path / "pillow.jpg", "wb") as file:
+        file.write(bytes)
 
 
 def cv2_scale(jpeg_bytes, tmp_path):
     # convert to cv2 format that can be resized by cv2
     nparr = numpy.frombuffer(jpeg_bytes, numpy.uint8)
     img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    assert img_np is not None
 
     scale_percent = 50  # percent of original size
     width = int(img_np.shape[1] * scale_percent / 100)
@@ -121,13 +74,15 @@ def cv2_scale(jpeg_bytes, tmp_path):
     dim = (width, height)
 
     # resize image
-    img_np_resized = cv2.resize(img_np, dim, interpolation=cv2.INTER_CUBIC)  # bicubic
+    img_np_resized = cv2.resize(img_np, dim, interpolation=cv2.INTER_LINEAR)  # bicubic
 
     # and encode to jpeg again
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
     result, encimg = cv2.imencode(".jpg", img_np_resized, encode_param)
 
-    return encimg.tobytes()
+    bytes = encimg.tobytes()
+    with open(tmp_path / "cv2.jpg", "wb") as file:
+        file.write(bytes)
 
 
 @pytest.fixture(
@@ -136,9 +91,6 @@ def cv2_scale(jpeg_bytes, tmp_path):
         "simplejpeg_scale",
         "pillow_scale",
         "cv2_scale",
-        "pyvips_scale",
-        "pyvips_resize_scale",
-        "ffmpeg_scale",
     ]
 )
 def library(request):
@@ -164,12 +116,19 @@ def image_lores() -> Generator[bytes, None, None]:
 
 
 @pytest.mark.benchmark(group="scalejpeg_hires")
-def test_libraries_encode_hires(library, image_hires, benchmark, tmp_path):
+def test_scale_hires(library, image_hires, benchmark, tmp_path):
     benchmark(eval(library), jpeg_bytes=image_hires, tmp_path=tmp_path)
     assert True
 
 
 @pytest.mark.benchmark(group="scalejpeg_lores")
-def test_libraries_encode_lores(library, image_lores, benchmark, tmp_path):
+def test_scale_lores(library, image_lores, benchmark, tmp_path):
     benchmark(eval(library), jpeg_bytes=image_lores, tmp_path=tmp_path)
     assert True
+
+
+def test_quality_compare_hires(image_hires, tmp_path):
+    turbojpeg_scale(jpeg_bytes=image_hires, tmp_path=tmp_path)
+    simplejpeg_scale(jpeg_bytes=image_hires, tmp_path=tmp_path)
+    pillow_scale(jpeg_bytes=image_hires, tmp_path=tmp_path)
+    cv2_scale(jpeg_bytes=image_hires, tmp_path=tmp_path)

@@ -24,6 +24,7 @@ __pycache__
 coverage.xml
 junit/*
 /tests_tmp
+.benchmarks/
 
 # build backends
 dist/*
@@ -33,8 +34,10 @@ dist/*
 # ignore .DS_Store files in macos
 .DS_Store
 
-# ignore drawing of statemachine
+
 diagram_ProcessingPicture.png
+openapi.json
 
 # testing
 /experimental
+

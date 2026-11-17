@@ -46,8 +46,17 @@ class ShareProcessing(BaseModel):
 
     share_command: str = Field(
         default="echo {filename}",
-        description="Command issued to share/print. Use {filename} as placeholder for the mediaitem to be shared/printed.",
+        description="Command issued to share/print. Use {filename} as placeholder for the mediaitem to be shared/printed. Also available: {printer_name}=given printer name below, {media_type}=[image,collage,video,animation] and {action_config_name} which is the action name defined in the config.",
     )
+    printer_name: str = Field(
+        default="PDF",
+        description="When the command is to print to a real printer, you can set it's name here and it will be available as {printer_name} in the share command. Doing so allows to check if the printer is idle before a print.",
+    )
+    check_if_printer_is_idle: bool = Field(
+        default=False,
+        description="Check if the printer is idle, which is an indicator for availablity. Otherwise the OS may state the printer is busy (actually printing or missing paper, ...). This way, prints can be stopped in the app to avoid flooding the print spooler.",
+    )
+
     ask_user_for_parameter_input: bool = Field(
         default=False,
         description="If enabled, when the share button is activated, a dialog pops up to input below configured parameters.",
@@ -117,7 +126,7 @@ class GroupShare(BaseModel):
                 name="Printing",
                 handles_images_only=True,
                 processing=ShareProcessing(
-                    share_command="echo {filename} {copies}",
+                    share_command="echo printing {filename} on {printer_name} media_type={media_type} action_config_name={action_config_name} copies={copies}",
                     ask_user_for_parameter_input=False,
                     share_blocked_time=3,
                     parameters=[ShareProcessingParameters()],
@@ -132,7 +141,7 @@ class GroupShare(BaseModel):
                 name="Printing copies",
                 handles_images_only=True,
                 processing=ShareProcessing(
-                    share_command="echo {filename} {copies}",
+                    share_command="echo printing {filename} on {printer_name} media_type={media_type} action_config_name={action_config_name} copies={copies}",
                     ask_user_for_parameter_input=True,
                     parameters_dialog_caption="How many copies?",
                     share_blocked_time=3,
@@ -148,7 +157,7 @@ class GroupShare(BaseModel):
                 name="Mailing action",
                 handles_images_only=False,
                 processing=ShareProcessing(
-                    share_command="echo {filename} to mail {mail}",
+                    share_command="echo {filename} media_type={media_type} action_config_name={action_config_name} to mail {mail}",
                     ask_user_for_parameter_input=True,
                     parameters_dialog_caption="E-Mail your image...",
                     parameters_dialog_action_icon="mail",

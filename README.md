@@ -3,40 +3,40 @@
 Welcome to your brand-new open-source photobooth-app! Written in Python 🐍, coming along with a modern Vue3 frontend.
 
 [![PyPI](https://img.shields.io/pypi/v/photobooth-app)](https://pypi.org/project/photobooth-app/)
-[![ruff](https://github.com/photobooth-app/photobooth-app/actions/workflows/ruff.yml/badge.svg)](https://github.com/photobooth-app/photobooth-app/actions/workflows/ruff.yml)
+[![lint](https://github.com/photobooth-app/photobooth-app/actions/workflows/linter.yml/badge.svg)](https://github.com/photobooth-app/photobooth-app/actions/workflows/linter.yml)
 [![pytest](https://github.com/photobooth-app/photobooth-app/actions/workflows/pytests.yml/badge.svg)](https://github.com/photobooth-app/photobooth-app/actions/workflows/pytests.yml)
 [![codecov](https://codecov.io/gh/photobooth-app/photobooth-app/branch/main/graph/badge.svg?token=SBB5DGX17V)](https://codecov.io/gh/photobooth-app/photobooth-app)
 [![crowdin](https://badges.crowdin.net/photobooth-app/localized.svg)](https://crowdin.com/project/photobooth-app)
 
-**[Installation](https://photobooth-app.org/setup/installation/)** - **[Documentation](https://photobooth-app.org/)** - **[PyPI package](https://pypi.org/project/photobooth-app/)** - **[3d printed box](https://photobooth-app.org/photobox3dprint/)**
+**[Installation](https://photobooth-app.org/setup/installation)** - **[Documentation](https://photobooth-app.org/)** - **[PyPI package](https://pypi.org/project/photobooth-app/)** - **[3d printed box](https://photobooth-app.org/3dprintedphotobooth/)**
 
 ## 😍 Features
 
-📷 Capture stills, animated gif, collages and even 📹 videos!  
+📷 Capture stills, animated gif, collages, 🪃 boomerangs and 3d wigglegrams!  
 🫶 Supports DSLR, Raspberry Pi cameras and webcameras  
-🎉 Camera live preview with shortest delay as possible, permanent video live view in background  
+🎉 Live preview during countdown and on the home screen  
 🛫 Optimized for speed, highly response UI  
-🫶 Several camera backends supported for high quality stills and livestream  
-💡 Countdown animation using customizable WLED module
-🤝 Linux 🐧, Raspberry Pi 🍓 and Windows 🪟 platforms supported  
+🫶 Combine multiple cameras, dedicate one for high quality stills and another one for the livestream  
+💡 Integrates with WLED to signal countdown using LED rings  
+🤝 Linux, Raspberry Pi and Windows platforms supported  
 🔓 Open-source, non-restrictive MIT license  
 
-[![photobooth-app screenshot of the frontpage](https://raw.githubusercontent.com/photobooth-app/photobooth-app/main/assets/screenshots/frontpage.png)](https://photobooth-app.org/screenshots/)
+[![photobooth-app screenshot of the frontpage](https://raw.githubusercontent.com/photobooth-app/photobooth-app/main/assets/screenshots/frontpage.png)](https://photobooth-app.org/introduction/screenshots)
 
-[Find more screenshots in the documentation](https://photobooth-app.org/screenshots/)
+[Find more screenshots in the documentation](https://photobooth-app.org/introduction/screenshots)
 
 ## 🔧 Build your own
 
 Following resources are helpful to start building your own photobooth:
 
-- [Requirements](https://photobooth-app.org/setup/installation/#prerequisites)
-- [Installation instructions](https://photobooth-app.org/setup/installation/)
-- [Camera specific setup](https://photobooth-app.org/setup/camera_setup/)
+- [Requirements](https://photobooth-app.org/setup/installation#prerequisites)
+- [Installation instructions](https://photobooth-app.org/setup/installation)
+- [Camera specific setup](https://photobooth-app.org/setup/configuration/camera_setup)
 
 You need inspiration first, have a look what others did:
 
-- [3d-printed reference photobooth-box](https://photobooth-app.org/photobox3dprint/)
-- [Example projects](https://photobooth-app.org/projects/)
+- [3d-printed reference photobooth-box](https://photobooth-app.org/3dprintedphotobooth/)
+- [Example projects](https://photobooth-app.org/introduction/projects)
 - [Find screenshots in the documentation](https://photobooth-app.org/screenshots)
 
 ### ©️ License

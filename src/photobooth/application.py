@@ -4,6 +4,7 @@ import logging
 import signal
 import threading
 from contextlib import asynccontextmanager
+from importlib.metadata import version
 from pathlib import Path
 from types import FrameType
 
@@ -13,12 +14,12 @@ from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi.requests import Request
 from fastapi.staticfiles import StaticFiles
 
-from .__version__ import __version__
 from .container import container
 from .routers import api, api_admin
 from .routers.media import media_router
 from .routers.static import static_router
 from .routers.userdata import userdata_router
+from .services.sse import sse_service
 
 logger = logging.getLogger(f"{__name__}")
 
@@ -32,8 +33,11 @@ async def lifespan(_: FastAPI):
     default_sigint_handler = signal.getsignal(signal.SIGINT)
 
     def terminate_now(signum: int, frame: FrameType | None = None):
-        logger.info("shutting down app via signal handler")
+        logger.debug("shutting down app via signal handler")
+        sse_service.request_shutdown()
+
         container.stop()
+
         if callable(default_sigint_handler):
             default_sigint_handler(signum, frame)
 
@@ -41,9 +45,9 @@ async def lifespan(_: FastAPI):
         # https://github.com/encode/uvicorn/pull/871
         # Signals can only be listened to from the main thread.
         # usually only during testing, but no need in testing for this.
-        logger.info("lifecycle hook not installing signal, because current_thread not main_thread")
+        logger.debug("lifecycle hook not installing signal, because current_thread not main_thread")
     else:
-        logger.info("lifecycle hook installing signal to handle app shutdown")
+        logger.debug("lifecycle hook installing signal to handle app shutdown")
         signal.signal(signal.SIGINT, terminate_now)  # invoked when CTRL-C
         signal.signal(signal.SIGTERM, terminate_now)  # sent by systemd on stop
 
@@ -53,12 +57,10 @@ async def lifespan(_: FastAPI):
 
 
 def _create_app() -> FastAPI:
-    container.logging_service.start()
-
     _app = FastAPI(
         title="Photobooth-App API",
         description="API may change any time.",
-        version=__version__,
+        version=version("photobooth-app"),
         contact={
             "name": "mgineer85",
             "url": "https://github.com/photobooth-app/photobooth-app",
@@ -80,8 +82,12 @@ def _create_app() -> FastAPI:
     _app.include_router(static_router)
     _app.include_router(userdata_router)
 
-    # serve the spa
-    _app.mount("/", StaticFiles(directory=Path(__file__).parent.resolve().joinpath("web_spa")), name="web_spa")
+    # also for convenience serve the share file so when a local hotspot is open it works just out of the box.
+    _app.mount(
+        "/sharepage/", StaticFiles(directory=Path(__file__).parent.parent.resolve().joinpath("web/sharepage"), html=True), name="web_sharepage"
+    )
+    # serve the spa # this is last so it catches all if not found a match earlier.
+    _app.mount("/", StaticFiles(directory=Path(__file__).parent.parent.resolve().joinpath("web/frontend"), html=True), name="web_spa")
 
     async def custom_http_exception_handler(request: Request, exc):
         logger.error(f"HTTPException: {request.url=} {exc=}")

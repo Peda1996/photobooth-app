@@ -13,20 +13,21 @@ permissions:
 
 jobs:
   tests:
+    env:
+      NUMBA_DEBUG: "0"
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python and uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
-          python-version: '3.13'
+          python-version: '3.14'
           enable-cache: true
       - name: Install system apt dependencies
         run: |
           sudo apt update
-          sudo apt -y install libturbojpeg python3-pip libgl1 git libcap-dev
-          sudo apt -y install libvips-dev --no-install-recommends
+          sudo apt -y install libturbojpeg0 python3-pip libgl1 git libcap-dev
           sudo apt -y install ffmpeg
       - name: install the project
         run: |
@@ -40,17 +41,19 @@ jobs:
   tests-hardware-rpi:
     env:
       # use system python to allow for picamera2 to import
-      UV_PYTHON: 3.11
+      UV_PYTHON: 3.13
       UV_PYTHON_PREFERENCE: only-system
+      NUMBA_DEBUG: "0"
 
     runs-on: [self-hosted, rpi]
     if: ${{ github.repository_owner == 'photobooth-app' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: uv venv --system-site-packages
       - run: uv sync # install in-project env
 
       - name: Test with pytest
         run: |
           uv run pytest --basetemp=./tests_tmp/ -v ./src/tests/benchmarks
+

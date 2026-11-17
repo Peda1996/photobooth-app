@@ -3,7 +3,7 @@ from typing import Any, AnyStr
 
 from ..appconfig import appconfig
 from .base import BaseService
-from .config.baseconfig import BaseConfig, SchemaTypes
+from .config.baseconfig import BaseConfig
 from .pluginmanager import PluginManagerService
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,16 @@ class ConfigurationService(BaseService):
 
         self._pms = pluginmanager_service
 
+    def start(self):
+        super().start()
+
+        super().started()
+
+    def stop(self):
+        super().stop()
+
+        super().stopped()
+
     def save(self, configurable: str):
         appconfig_or_plugin_config = self._get_appconfig_or_pluginconfig(configurable)
         appconfig_or_plugin_config.persist()
@@ -22,15 +32,15 @@ class ConfigurationService(BaseService):
     def reset(self, configurable: str):
         appconfig_or_plugin_config = self._get_appconfig_or_pluginconfig(configurable)
         appconfig_or_plugin_config.deleteconfig()
-        appconfig_or_plugin_config.reset_defaults()
+        appconfig_or_plugin_config.__init__()  # reload in place (defaults because config is deleted)
 
     def list_configurables(self) -> list[str]:
         configurable_elements = ["app"] + self._pms.list_configurable_plugins()
         return configurable_elements
 
-    def get_schema(self, configurable: str, schema_type: SchemaTypes = "default"):
+    def get_schema(self, configurable: str):
         appconfig_or_plugin_config = self._get_appconfig_or_pluginconfig(configurable)
-        return appconfig_or_plugin_config.get_schema(schema_type=schema_type)
+        return appconfig_or_plugin_config.get_schema()
 
     def get_current(self, configurable: str, secrets_is_allowed: bool = False) -> dict[str, Any]:
         appconfig_or_plugin_config = self._get_appconfig_or_pluginconfig(configurable)
@@ -38,10 +48,13 @@ class ConfigurationService(BaseService):
 
     def validate_and_set_current_and_persist(self, configurable: str, updated_config: dict[AnyStr, Any]):
         appconfig_or_plugin_config = self._get_appconfig_or_pluginconfig(configurable)
-        updated_config_validated = appconfig_or_plugin_config.model_validate(updated_config)
-        appconfig_or_plugin_config.__dict__.update(updated_config_validated)
 
-        appconfig_or_plugin_config.persist()
+        # validate posted config and persist
+        updated_config_validated = appconfig_or_plugin_config.model_validate(updated_config)
+        updated_config_validated.persist()
+
+        # reload in-place https://docs.pydantic.dev/latest/concepts/pydantic_settings/#in-place-reloading
+        appconfig_or_plugin_config.__init__()
 
     def _get_appconfig_or_pluginconfig(self, configurable: str) -> BaseConfig:
         if not configurable:

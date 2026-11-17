@@ -1,10 +1,10 @@
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, FilePath
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_extra_types.color import Color
 
-from ..validators import ensure_demoassets
+from ..models.frameoverlay import FrameOverlay
 
 
 class GroupUiSettings(BaseModel):
@@ -18,8 +18,8 @@ class GroupUiSettings(BaseModel):
     )
 
     SECONDARY_COLOR: Color = Field(
-        default=Color("#b8124f"),
-        description="Secondary color (admin interface, accents).",
+        default=Color("#4283b8"),
+        description="Secondary color (countdown, accents).",
     )
 
     theme: Literal["system", "light", "dark"] = Field(
@@ -71,18 +71,20 @@ class GroupUiSettings(BaseModel):
         default=True,
         description="Display the livestream blurred in the background of the actual livestream covering the full screen. This might look nice if the livestream resolution does not match the screen's aspect ratio. Check cpu usage on low power devices.",
     )
-    enable_livestream_frameoverlay: bool = Field(
-        default=True,
-        description="Enable to overlay livestream_frameoverlay_image the livestream.",
-    )
-    livestream_frameoverlay_image: Annotated[FilePath | None, BeforeValidator(ensure_demoassets)] = Field(
-        default=Path("userdata/demoassets/frames/frame_image_photobooth-app.png"),
-        description="When enabled, the frame is overlayed the livestream. This image is not used in the postprocessing. If mirroreffect is on, it will also be mirrored. Text in the frame appears in the wrong direction but the final image is correct.",
-        json_schema_extra={"list_api": "/api/admin/enumerate/userfiles"},
-    )
-    livestream_frameoverlay_mirror_effect: bool = Field(
+    livestream_blurredbackground_high_framerate: bool = Field(
         default=False,
-        description="Flip the frame overlaid horizontally to create a mirror effect. Useful to flip also if video is flipped when people shall align to the frame. If there is text in the frame it's also mirrored.",
+        description="To save CPU, the blurred refreshs only every 300ms/3.3fps. If the app runs on a beefy computer, you can enable the higher framerate refreshing every 50ms/20fps.",
+        json_schema_extra={"computeIntense": True},
+    )
+
+    livestream_frameoverlay: FrameOverlay = Field(
+        title="Livestream Frame Overlay",
+        description="test",
+        default=FrameOverlay(
+            enable=True,
+            image=Path("userdata/demoassets/frames/frame_image_photobooth-app.png"),
+            mirror_effect=True,
+        ),
     )
 
     FRONTPAGE_TEXT: str = Field(
@@ -120,6 +122,11 @@ class GroupUiSettings(BaseModel):
         default="Scan above code with your phone.",
         description="Display text below the QR code.",
     )
+    qrcode_link_codes: bool = Field(
+        default=False,
+        description="Clickable link is added to the QR code itself. This can be helpful for testing but should be disabled on a production system to avoid users escape out of the app.",
+    )
+
     gallery_show_filter: bool = Field(
         default=True,
         description="Show filter provided by plugins. Pilgram2 filter are included in the app. See documentation to extend and build your own plugin.",
@@ -135,4 +142,8 @@ class GroupUiSettings(BaseModel):
     gallery_show_shareprint: bool = Field(
         default=True,
         description="Show the share/print buttons in gallery.",
+    )
+    itempresenter_show_trigger_last_action_again: bool = Field(
+        default=True,
+        description="Show a button to directly trigger the last action again in the presenter after a capture has been taken.",
     )

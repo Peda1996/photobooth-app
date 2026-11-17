@@ -1,5 +1,5 @@
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 import jwt
@@ -57,6 +57,8 @@ def get_user(db: dict[str, UserInDB], user_id: str) -> UserInDB | None:
     if user_id in db:
         return db[user_id]
 
+    return None
+
 
 def authenticate_user(users_db, user_id: str, password: str):
     user = get_user(users_db, user_id)
@@ -69,9 +71,9 @@ def authenticate_user(users_db, user_id: str, password: str):
 
 def create_access_token(data: dict, expires_delta: timedelta):
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + expires_delta
+    expire = datetime.now(UTC) + expires_delta
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, appconfig.misc.secret_key, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, appconfig.misc.secret, algorithm=ALGORITHM)
     return encoded_jwt
 
 
@@ -82,8 +84,8 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, appconfig.misc.secret_key, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
+        payload = jwt.decode(token, appconfig.misc.secret, algorithms=[ALGORITHM])
+        username = payload.get("sub")
         if not username:
             raise credentials_exception
         token_data = TokenData(username=username)

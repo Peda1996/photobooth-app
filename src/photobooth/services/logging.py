@@ -8,14 +8,17 @@ import sys
 import threading
 import time
 from datetime import datetime
-from logging import FileHandler, LogRecord
 from pathlib import Path
+from typing import Literal
 
 from .. import LOG_PATH
 from ..appconfig import appconfig
 from .base import BaseService
 from .sse import sse_service
 from .sse.sse_ import SseEventLogRecord
+
+## formatter ## # add %(name)s temporary to find other modules names to mute below
+fmt = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
 
 
 class EventstreamLogHandler(logging.Handler):
@@ -27,7 +30,7 @@ class EventstreamLogHandler(logging.Handler):
     def __init__(self):
         logging.Handler.__init__(self)
 
-    def emit(self, record: LogRecord):
+    def emit(self, record: logging.LogRecord):
         sse_logrecord = SseEventLogRecord(
             time=datetime.fromtimestamp(record.created).strftime("%d.%b.%y %H:%M:%S"),
             level=record.levelname,
@@ -40,16 +43,36 @@ class EventstreamLogHandler(logging.Handler):
         sse_service.dispatch_event(sse_logrecord)
 
 
+class ConsoleColorFormatter(logging.Formatter):
+    grey = "\x1b[90m"  # bright black / grey
+    white = "\x1b[37m"  # standard white
+    yellow = "\x1b[33m"  # yellow
+    red = "\x1b[31m"  # red
+    bold_red = "\x1b[1;31m"  # bold red
+    reset = "\x1b[0m"  # reset to default
+
+    FORMATS = {
+        logging.DEBUG: grey + fmt + reset,
+        logging.INFO: white + fmt + reset,
+        logging.WARNING: yellow + fmt + reset,
+        logging.ERROR: red + fmt + reset,
+        logging.CRITICAL: bold_red + fmt + reset,
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+
 class LoggingService(BaseService):
     """_summary_"""
 
-    logging_level = logging.DEBUG
+    logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "DEBUG"
 
     def __init__(self):
         super().__init__()
 
-        ## formatter ##
-        fmt = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
         log_formatter = logging.Formatter(fmt=fmt)
 
         # filename per day to log to
@@ -59,9 +82,7 @@ class LoggingService(BaseService):
         # latest basicConfig adds a streamHandler output to console if not automatically called
         # earlier by some .warn .info or other
         # force=False because otherwise the pytest console logger stream handler gets deleted
-        logging.basicConfig(level=logging.DEBUG, format=fmt, force=False, encoding="utf-8")
-        logging.debug("loggingservice __init__ basicConfig set")
-        logging.debug("loggingservice __init__ started")
+        logging.basicConfig(level=logging.DEBUG, format=fmt, force=False)
 
         self.logging_level = appconfig.common.logging_level
 
@@ -75,8 +96,15 @@ class LoggingService(BaseService):
         root_logger.setLevel(self.logging_level)
 
         ## handler
+        # colorize console output.
+        stream_handler = None
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                stream_handler = handler
+                stream_handler.setFormatter(ConsoleColorFormatter())
+                break
 
-        self.file_handler = FileHandler(filename=logfile, mode="a", encoding="utf-8", delay=True)
+        self.file_handler = logging.FileHandler(filename=logfile, mode="a", encoding="utf-8", delay=True)
         self.file_handler.setFormatter(log_formatter)
 
         # create rotatingFileHandler
@@ -95,10 +123,15 @@ class LoggingService(BaseService):
         threading.excepthook = self._handle_threading_exception
         # no solution to handle exceptions in sep processes yet...
 
-        logging.debug("loggingservice __init__ finished")
-        logging.debug(f"registered handlers: {logging.root.handlers}")
-
         self.remove_old_logs()
+
+    def start(self):
+        super().start()
+        super().started()
+
+    def stop(self):
+        super().stop()
+        super().stopped()
 
     def remove_old_logs(self):
         DAYS = 7
@@ -116,13 +149,17 @@ class LoggingService(BaseService):
         """mute some logger by rasing their log level"""
 
         for name in [
+            "picamera2",
             "picamera2.picamera2",
             "sse_starlette.sse",
-            "PIL.PngImagePlugin",
-            "PIL.TiffImagePlugin",
+            "PIL",
             "multipart",
             "requests",
             "urllib3",
+            "urllib3_future",
+            "pynng",
+            "python_multipart.multipart",
+            "statemachine",
         ]:
             # mute some other logger, by raising their debug level to INFO
             lgr = logging.getLogger(name=name)
@@ -133,6 +170,8 @@ class LoggingService(BaseService):
             "pywifi",
             "v4l2py",
             "linuxpy",
+            "httpcore2",
+            "httpx2",
         ]:
             # mute some other logger, by raising their debug level to INFO
             lgr = logging.getLogger(name=name)
@@ -150,7 +189,7 @@ class LoggingService(BaseService):
             "uvicorn",
         ]:
             lgr = logging.getLogger(name=name)
-            lgr.setLevel(logging.INFO)
+            lgr.setLevel(logging.WARNING)
             lgr.propagate = False
             lgr.handlers = [
                 logging.root.handlers[0],  # this is the streamhandler if not in pytest.

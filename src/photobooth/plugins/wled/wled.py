@@ -1,103 +1,161 @@
 import json
 import logging
+import threading
 import time
+from enum import Enum
+from queue import Empty, Full, Queue
 
 import serial
 from statemachine import Event, State
 
-from ...utils.repeatedtimer import RepeatedTimer
+from ...utils.resilientservice import ResilientService
 from .. import hookimpl
 from ..base_plugin import BasePlugin
 from .config import WledConfig
 
 logger = logging.getLogger(__name__)
+
+
 # these presets are set on WLED module to control lights:
-PRESET_ID_STANDBY = 1
-PRESET_ID_COUNTDOWN = 2
-PRESET_ID_SHOOT = 3
-PRESET_ID_RECORD = 4
+class WledPreset(Enum):
+    STANDBY = 1  # int number is sent to wled module
+    THRILL = 2
+    SHOOT = 3
+    RECORD = 4
 
-RECONNECT_INTERVAL_TIMER = 10
+    # new in v9 - intended to use with a matrix ws2812 module (like 4x4) to display arrows directing to the lens of the according camera
+    THRILL_STILL = 20
+    THRILL_VIDEO = 21
+    THRILL_MULTICAM = 22
 
 
-class Wled(BasePlugin[WledConfig]):
+class Wled(ResilientService, BasePlugin[WledConfig]):
     def __init__(self):
         super().__init__()
 
         self._config: WledConfig = WledConfig()
 
         self._serial: serial.Serial | None = None
-        self._reconnect_interval_timer: RepeatedTimer = RepeatedTimer(RECONNECT_INTERVAL_TIMER, self.connect)
+        self._service_ready: threading.Event = threading.Event()
+
+        # None in queue can be used on shutdown to reduce waiting for timeout
+        # None in variable means there is no wled service running that could process external triggers.
+        self._queue: Queue[WledPreset | None] | None = None
+
+    def __str__(self):
+        return f"WLED ({self._config.common.serial_port})"
 
     @hookimpl
     def start(self):
-        if not self._config.wled_enabled:
+        """To start the resilient service"""
+
+        if not self._config.common.enabled:
             logger.info("WledService disabled")
-            # super().disabled()
             return
 
-        if not self._config.wled_serial_port:
-            logger.info("given serial port empty. define valid port!")
-            # super().faulty()
+        # check for empty port fails here in start. that means resilientservice is not started
+        # and there are no log messages permanently about the false config.
+        # but maybe it's better to log this cyclic to show the user there is a mistake in the config?
+        if not self._config.common.serial_port:
+            logger.warning("WLED plugin enabled but given serial port is empty. Define a valid port!")
             return
 
-        self.connect()
-
-        self._reconnect_interval_timer.start()
-
-        logger.info(f"WledService enabled and initialized, using port {self._config.wled_serial_port}")
+        super().start()
 
     @hookimpl
     def stop(self):
-        self._reconnect_interval_timer.stop()
+        """To stop the resilient service"""
+
+        super().stop()
+
+    def setup_resource(self):
+        if not self.device_init():
+            raise OSError("the wled module could not initialize properly, checks logs and module.")
+
+        # add very little time to give wled module and serial connection everything is settled
+        time.sleep(0.2)
+
+        # on run always reset to start with a clear queue
+        self._queue = Queue(maxsize=3)
+
+        self.send_preset(WledPreset.STANDBY)
+
+    def teardown_resource(self):
+        self._service_ready.clear()
+
+        if self._queue:
+            try:
+                # send none to stop waiting for any further events and immediate shutdown
+                self._queue.put_nowait(None)
+            except Exception:
+                # failing to put None shall not raise an Expection during teardown
+                pass
 
         if self._serial:
-            logger.info("close port to WLED module")
+            logger.info("cancel read if any and close port to WLED module")
+            self._serial.cancel_read()
             self._serial.close()
+
+    def wait_until_ready(self, timeout: float = 5) -> bool:
+        return self._service_ready.wait(timeout=timeout)
 
     @hookimpl
     def sm_on_enter_state(self, source: State, target: State, event: Event):
-        if target.id == "counting":
-            self.preset_thrill()
-
-        elif target.id == "record":
-            self.preset_record()
-
-        elif target.id == "finished":
-            self.preset_standby()
+        if target.id == "finished":
+            self.send_preset(WledPreset.STANDBY)
 
     @hookimpl
-    def sm_on_exit_state(self, source: State, target: State, event: Event):
-        if source.id == "record":
-            self.preset_standby()
+    def acq_thrill(self):
+        if not self._config.common.use_separate_thrill_presets:
+            self.send_preset(WledPreset.THRILL)
 
     @hookimpl
-    def acq_before_shot(self):
-        self.preset_shoot()
+    def acq_thrill_still(self):
+        if self._config.common.use_separate_thrill_presets:
+            self.send_preset(WledPreset.THRILL_STILL)
+
+    @hookimpl
+    def acq_thrill_video(self):
+        if self._config.common.use_separate_thrill_presets:
+            self.send_preset(WledPreset.THRILL_VIDEO)
+
+    @hookimpl
+    def acq_thrill_multicam(self):
+        if self._config.common.use_separate_thrill_presets:
+            self.send_preset(WledPreset.THRILL_MULTICAM)
+
+    @hookimpl
+    def acq_before_get_still(self):
+        self.send_preset(WledPreset.SHOOT)
+
+    @hookimpl
+    def acq_before_get_multicam(self):
+        self.send_preset(WledPreset.SHOOT)
+
+    @hookimpl
+    def acq_before_get_video(self):
+        self.send_preset(WledPreset.RECORD)
 
     @hookimpl
     def acq_after_shot(self):
-        self.preset_standby()
+        self.send_preset(WledPreset.STANDBY)
 
-    def is_connected(self) -> bool:
-        return self._serial is not None and self._serial.is_open
+    def send_preset(self, preset: WledPreset):
+        # print(f"\n\n{preset.value} {preset.name}\n")
 
-    def connect(self):
-        if not self.is_connected():
-            try:
-                self.device_init()
+        if not self._queue:
+            # no queue, request ignored.
+            return
 
-                # add very little time to give wled module and serial connection everything is settled
-                time.sleep(0.2)
-
-                self.preset_standby()
-            except Exception as exc:
-                logger.warning(f"failed to init WLED! check device, connection and config. {exc}")
+        try:
+            self._queue.put_nowait(preset)
+        except Full:
+            logger.warning("the queue to send wled presets is full, maybe the service died?")
 
     def device_init(self) -> bool:
         try:
             self._serial = serial.Serial(
-                port=self._config.wled_serial_port,
+                port=self._config.common.serial_port,
                 baudrate=115200,
                 bytesize=8,
                 timeout=1,
@@ -109,8 +167,7 @@ class Wled(BasePlugin[WledConfig]):
 
         except serial.SerialException as exc:
             logger.critical(f"failed to open WLED module, ESP flashed and correct serial port set in config? {exc}")
-
-            raise RuntimeError("WLED module connection failed!") from exc
+            raise RuntimeError(f"WLED module connection failed, error {exc}") from exc
 
         # ask WLED module for version (format: WLED YYYYMMDD)
         try:
@@ -120,76 +177,43 @@ class Wled(BasePlugin[WledConfig]):
             raise RuntimeError("fail to write identify request to WLED module") from exc
 
         wled_detected = False
+
+        # readline blocks for timeout seconds (set to 1sec on init), afterwards fails
+        wled_response = self._serial.readline(32)
+        if wled_response == b"":  # \n is missing, which indicates a timeout
+            # timeout is defined by response being empty
+            logger.critical("WLED device did not respond during setup. Check device and connections!")
+            raise TimeoutError("no answer from serial WLED device received within timeout")
+
         try:
-            # readline blocks for timeout seconds (set to 1sec on init), afterwards fails
-            wled_response = self._serial.readline()
+            # indicates WLED module found:
+            wled_detected = "WLED" in wled_response.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            logger.critical(f"message from WLED module not understood {exc} {wled_response}")
+            raise RuntimeError("failed to identify WLED device, maybe wrong port chosen?") from exc
 
-            if wled_response == b"":
-                # timeout is defined by response being empty
-                raise TimeoutError("no answer from serial WLED device received within timeout")
-
-            try:
-                # indicates WLED module found:
-                wled_detected = "WLED" in wled_response.decode("ascii").strip()
-            except UnicodeDecodeError as exc:
-                logger.critical(f"message from WLED module not understood {exc} {wled_response}")
-
-        except TimeoutError as exc:
-            logger.critical(f"WLED device did not respond during setup. Check device and connections! {exc}")
-        else:
-            logger.info(f"WLED version response: {wled_response}")
-        logger.debug(f"{wled_detected=}")
-
-        if not wled_detected:
-            # abort init due to problems
-            if self._serial:
-                logger.info("close port to WLED module")
-                self._serial.close()
-            # program continues this way, but no light integration available,
-            # use error log to find out how to solve
-            logger.critical("WLED module failed. Please check wiring, device, connection and config.")
-            raise RuntimeError("WLED module failed. Please check wiring, device, connection and config.")
+        logger.info(f"WLED detected: {'yes' if wled_detected else 'no'}, version response: {wled_response}")
 
         return wled_detected
 
-    def preset_standby(self):
-        if not self._serial:
-            return
-
-        self._write_request(self._request_preset(PRESET_ID_STANDBY))
-
-    def preset_thrill(self):
-        if not self._serial:
-            return
-
-        self._write_request(self._request_preset(PRESET_ID_COUNTDOWN))
-
-    def preset_shoot(self):
-        if not self._serial:
-            return
-
-        self._write_request(self._request_preset(PRESET_ID_SHOOT))
-
-    def preset_record(self):
-        if not self._serial:
-            return
-
-        self._write_request(self._request_preset(PRESET_ID_RECORD))
-
-    def _write_request(self, request: bytes):
-        if not self.is_connected():
-            logger.warning(f"WLED module not connected, ignoring request '{request}'")
-            return
-
+    def run_service(self):
         assert self._serial
-        try:
-            self._serial.write(request)
-        except serial.SerialException as exc:
-            # close connection because then the device is unconnected and can be reconnected later.
-            self._serial.close()
-            logger.warning(f"error accessing WLED device, connection loss? device unpowered? {exc}")
+        assert self._queue
 
-    @staticmethod
-    def _request_preset(preset_id: int = -1):
-        _request_preset_bytes = json.dumps({"ps": preset_id}).encode()
-        return _request_preset_bytes
+        self._service_ready.set()
+
+        while not self._stop_event.is_set():
+            try:
+                preset = self._queue.get(timeout=1)
+            except Empty:
+                continue
+
+            if preset is None:
+                # shutdown is requested
+                break
+
+            self._serial.write(json.dumps({"ps": preset.value}).encode())
+
+            # add a small delay after every write so wled can settle and on fast changes the LED effect is at least
+            # visible for a short time.
+            time.sleep(0.25)

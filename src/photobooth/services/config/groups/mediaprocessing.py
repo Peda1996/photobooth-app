@@ -3,7 +3,11 @@ AppConfig class providing central config
 
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
+
+RembgModelType = Literal["modnet", "u2netp", "u2net"]
 
 
 class GroupMediaprocessing(BaseModel):
@@ -11,31 +15,24 @@ class GroupMediaprocessing(BaseModel):
 
     model_config = ConfigDict(title="Process media after capture")
 
-    HIRES_STILL_QUALITY: int = Field(
-        default=90,
-        ge=10,
-        le=100,
-        description="Still JPEG full resolution quality, applied to download images and images with filter",
-        json_schema_extra={"ui_component": "QSlider"},
-    )
-
     full_still_length: int = Field(
+        json_schema_extra={"computeIntense": True},
         default=1500,
         ge=800,
         le=5000,
-        description="Dimension of longer side used for scaling full images. Shorter side of the image is calculated to keep aspect ratio. For performance choose as low as possible but still gives decent print quality. Example: 1500/6inch=250dpi",
+        description="Minimum dimension of the longer side used to scale full captures. The shorter side is calculated to keep aspect ratio. For best performance choose as low as possible but still gives decent print quality. Example: 1500/6inch=250dpi",
     )
     preview_still_length: int = Field(
         default=1200,
         ge=200,
         le=2500,
-        description="Dimension of longer side used for scaling previews. Shorter side of the image is calculated to keep aspect ratio.",
+        description="Minimum dimension of the longer side used to scale preview captures. The shorter side is calculated to keep aspect ratio.",
     )
     thumbnail_still_length: int = Field(
         default=400,
         ge=100,
         le=1000,
-        description="Dimension of longer side used for scaling thumbnails. Shorter side of the image is calculated to keep aspect ratio.",
+        description="Minimum dimension of the longer side used to scale thumbnails captures. The shorter side is calculated to keep aspect ratio.",
     )
 
     video_bitrate: int = Field(
@@ -43,26 +40,26 @@ class GroupMediaprocessing(BaseModel):
         ge=1000,
         le=10000,
         description="Video quality bitrate in k.",
+        json_schema_extra={"ui_schema_extra": {"slider": True}},
     )
 
     video_compatibility_mode: bool = Field(
-        default=False,
-        description="Enable for improved video compatibility on iOS devices. Might reduce resulting quality slightly.",
+        default=True,
+        description="Enable for improved video compatibility on iOS devices and Firefox. Might reduce resulting quality slightly.",
     )
 
-    removechromakey_enable: bool = Field(
-        default=False,
-        description="Apply chromakey greenscreen removal from captured images",
+    remove_background_model: RembgModelType = Field(
+        default="modnet",
+        json_schema_extra={"computeIntense": True},
+        description="Select from predefined models. Modnet and u2netp are packaged with the app, other models will be downloaded on demand and cached, so on first use of other models, the app needs internet access. u2netp is a reduced model that is fastest, modnet usually only slightly slower but provides good results.",
     )
-    removechromakey_keycolor: int = Field(
-        default=110,
-        ge=0,
-        le=360,
-        description="Color (H) in HSV colorspace to remove on 360° scale.",
+
+    fileformat_animations: Literal["mp4", "webp", "avif", "gif"] = Field(
+        default="webp",
+        description="Format in which animations are stored. WebP is recommended nowadays. AVIF is a newer format, encodes fast, produces smallest files but is not yet broadly compatible. GIF is lower quality (max 256 colors), more compute intensive to encode but offers best compatibility. GIF is deprecated here.",
     )
-    removechromakey_tolerance: int = Field(
-        default=10,
-        ge=1,
-        le=50,
-        description="Tolerance for color (H) on chromakey color removal.",
+
+    fileformat_multicamera: Literal["mp4", "webp", "avif", "gif"] = Field(
+        default="mp4",
+        description="Format in which wigglegrams are stored. MP4 is recommended for quality and filesize as well as compatibility. WebP/AVIF are recommended over MP4 and GIF but still lack support sharing via WhatsApp. GIF is lower quality (max 256 colors), more compute intensive to encode but offers best compatibility. GIF is deprecated here.",
     )

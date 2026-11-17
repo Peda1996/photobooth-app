@@ -12,13 +12,11 @@ from pydantic_settings import SettingsConfigDict
 from ... import CONFIG_PATH
 from .baseconfig import BaseConfig
 from .groups.actions import GroupActions
-from .groups.backends import GroupBackends
+from .groups.cameras import GroupCameras
 from .groups.common import GroupCommon
-from .groups.filetransfer import GroupFileTransfer
 from .groups.hardwareinputoutput import GroupHardwareInputOutput
 from .groups.mediaprocessing import GroupMediaprocessing
 from .groups.misc import GroupMisc
-from .groups.qrshare import GroupQrShare
 from .groups.share import GroupShare
 from .groups.uisettings import GroupUiSettings
 
@@ -47,10 +45,8 @@ class AppConfig(BaseConfig):
     common: GroupCommon = GroupCommon()
     actions: GroupActions = GroupActions()
     share: GroupShare = GroupShare()
-    qrshare: GroupQrShare = GroupQrShare()
-    filetransfer: GroupFileTransfer = GroupFileTransfer()
     mediaprocessing: GroupMediaprocessing = GroupMediaprocessing()
     uisettings: GroupUiSettings = GroupUiSettings()
-    backends: GroupBackends = GroupBackends()
+    cameras: GroupCameras = GroupCameras()
     hardwareinputoutput: GroupHardwareInputOutput = GroupHardwareInputOutput()
     misc: GroupMisc = GroupMisc()

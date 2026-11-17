@@ -1,24 +1,20 @@
+import io
 import logging
-from collections.abc import Generator
+from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
+from uuid import uuid4
 
-import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
-from photobooth.application import app
 from photobooth.container import container
 from photobooth.services.processing import ProcessingService
+from photobooth.services.processor.models import Capture
+
+from ...util import get_jpeg
 
 logger = logging.getLogger(name=None)
-
-
-@pytest.fixture
-def client() -> Generator[TestClient, None, None]:
-    with TestClient(app=app, base_url="http://test/api/") as client:
-        container.start()
-        yield client
-        container.stop()
 
 
 def test_chose_video_stoprecording(client: TestClient):
@@ -81,3 +77,28 @@ def test_abort_exception(client: TestClient):
         response = client.get("/processing/abort")
         assert response.status_code == 500
         assert "detail" in response.json()
+
+
+def test_api_get_preview_image_filtered_success(client: TestClient, tmp_path: Path):
+    capture_id = uuid4()
+    file_in = Path(tmp_path, "file_in.jpg")
+    file_in.write_bytes(get_jpeg((800, 500)).getbuffer())
+
+    fake_capture = Capture(filepath=file_in, uuid=capture_id)
+
+    with patch("photobooth.services.processing.ProcessingService.get_capture", return_value=fake_capture):
+        response = client.get(f"/processing/approval/{capture_id}")
+        assert response.status_code == 200
+
+        # Response should be a valid image
+        img = Image.open(io.BytesIO(response.content))
+        img.verify()
+
+
+def test_api_get_preview_image_filtered_not_found(client: TestClient):
+    capture_id = uuid4()
+
+    with patch("photobooth.services.processing.ProcessingService.get_capture", side_effect=FileNotFoundError("not found")):
+        response = client.get(f"/processing/approval/{capture_id}")
+        assert response.status_code == 404
+        assert "cannot be found" in response.json()["detail"]

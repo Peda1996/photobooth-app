@@ -3,11 +3,12 @@ import time
 from collections.abc import Generator
 
 import pytest
+from PIL import Image
 
 from photobooth.appconfig import appconfig
 from photobooth.container import Container, container
 
-from ..util import video_duration
+from ..util import block_until_device_is_running, video_duration
 
 logger = logging.getLogger(name=None)
 
@@ -15,15 +16,18 @@ logger = logging.getLogger(name=None)
 # need fixture on module scope otherwise tests fail because GPIO lib gets messed up
 @pytest.fixture(scope="module")
 def _container() -> Generator[Container, None, None]:
-    # setup
-    container.start()
+    container.reload()
 
     # ensure video backend is running, otherwise tests can fail on slower devices like rpi4
-    container.aquisition_service._get_video_backend().block_until_device_is_running()
+    block_until_device_is_running(container.acquisition_service._video_backend)
 
-    # deliver
     yield container
     container.stop()
+
+
+def wait_for_user_input_requested():
+    if not container.processing_service._external_cmd_required.wait(timeout=5):
+        raise RuntimeError("waiting for user input not within timeout")
 
 
 def test_capture(_container: Container):
@@ -36,6 +40,12 @@ def test_capture(_container: Container):
     _container.processing_service.wait_until_job_finished()
 
     assert _container.processing_service._workflow_jobmodel is None
+
+    phase2_item = _container.mediacollection_service.get_item_latest()
+    assert phase2_item.processed.suffix.lower() == ".jpg"
+
+    with Image.open(phase2_item.processed, formats=["JPEG"]) as img:
+        img.verify()
 
 
 def test_capture_zero_countdown(_container: Container):
@@ -62,6 +72,12 @@ def test_collage_auto_approval(_container: Container):
 
     assert _container.processing_service._workflow_jobmodel is None
 
+    phase2_item = _container.mediacollection_service.get_item_latest()
+    assert phase2_item.processed.suffix.lower() == ".jpg"
+
+    with Image.open(phase2_item.processed, formats=["JPEG"]) as img:
+        img.verify()
+
 
 def test_collage_manual_approval(_container: Container):
     before_count = _container.mediacollection_service.count()
@@ -74,9 +90,11 @@ def test_collage_manual_approval(_container: Container):
 
     # observer that is used to confirm the captures.
     assert _container.processing_service._workflow_jobmodel is not None  # statemachine was created after trigger_action
-
+    wait_for_user_input_requested()
     _container.processing_service.continue_process()
+    wait_for_user_input_requested()
     _container.processing_service.reject_capture()
+    wait_for_user_input_requested()
     _container.processing_service.continue_process()
 
     _container.processing_service.wait_until_job_finished()
@@ -96,8 +114,11 @@ def test_collage_manual_abort(_container: Container):
 
     assert _container.processing_service._workflow_jobmodel is not None
 
+    wait_for_user_input_requested()
     _container.processing_service.continue_process()
+    wait_for_user_input_requested()
     _container.processing_service.reject_capture()
+    wait_for_user_input_requested()
     _container.processing_service.abort_process()
 
     _container.processing_service.wait_until_job_finished()
@@ -116,13 +137,18 @@ def test_animation(_container: Container):
 
     assert _container.processing_service._workflow_jobmodel is None
 
+    phase2_item = _container.mediacollection_service.get_item_latest()
+    assert phase2_item.processed.suffix.lower() in (".gif", ".avif", ".webp")
+
+    with Image.open(phase2_item.processed, formats=["GIF", "AVIF", "WEBP"]) as img:
+        img.verify()
+
 
 def test_video(_container: Container):
-    _container.processing_service.trigger_action("video", 0)
-
-    assert _container.processing_service._workflow_jobmodel is not None
     number_of_images_before = _container.mediacollection_service.count()
 
+    _container.processing_service.trigger_action("video", 0)
+    assert _container.processing_service._workflow_jobmodel is not None
     _container.processing_service.wait_until_job_finished()
 
     assert _container.processing_service._workflow_jobmodel is None
@@ -130,13 +156,19 @@ def test_video(_container: Container):
     assert _container.mediacollection_service.count() == number_of_images_before + 1
 
     video_item = _container.mediacollection_service.get_item_latest()
+    assert video_item.processed.suffix.lower() == ".mp4"
 
     # boomerang reverses video so double length
-    in_dur = appconfig.actions.video[0].processing.video_duration
-    out_dur = video_duration(video_item.unprocessed)
+    desired_video_duration = float(appconfig.actions.video[0].processing.video_duration)
+    out_dur = video_duration(video_item.processed)
+    logger.info(f"{round(out_dur, 1)}")
+
+    if appconfig.actions.video[0].processing.boomerang:
+        desired_video_duration *= 2.0
+        desired_video_duration /= appconfig.actions.video[0].processing.boomerang_speed
 
     # ensure written video is about in tolerance duration
-    assert out_dur == pytest.approx(in_dur * 2.0, 0.3)
+    assert out_dur == pytest.approx(desired_video_duration, abs=0.5)
 
 
 def test_video_stop_early(_container: Container):
@@ -145,16 +177,8 @@ def test_video_stop_early(_container: Container):
     assert _container.processing_service._workflow_jobmodel is not None
     number_of_images_before = _container.mediacollection_service.count()
 
-    # wait until actually recording
-    timeout_counter = 0
-    while not _container.aquisition_service.is_recording():
-        time.sleep(0.05)
-        timeout_counter += 0.05
-        if timeout_counter > 10:
-            raise RuntimeError("timed out waiting for record to start!")
-
-    # recording active, wait 3 secs before stopping.
-    desired_video_duration = 3
+    # recording active, wait 1 secs before stopping.
+    desired_video_duration = 1.0
     time.sleep(desired_video_duration)
     _container.processing_service.continue_process()
     _container.processing_service.wait_until_job_finished()
@@ -164,18 +188,21 @@ def test_video_stop_early(_container: Container):
     assert _container.mediacollection_service.count() == number_of_images_before + 1
 
     video_item = _container.mediacollection_service.get_item_latest()
+    assert video_item.processed.suffix.lower() == ".mp4"
 
     # ensure written video is about in tolerance duration
-    video_duration_seconds = abs(round(video_duration(video_item.unprocessed), 1))
-    logger.info(f"{video_duration_seconds=}")
+    video_duration_seconds = video_duration(video_item.processed)
+    logger.info(f"{round(video_duration_seconds, 1)}")
 
     # boomerang reverses video so double length
     if appconfig.actions.video[0].processing.boomerang:
-        desired_video_duration *= 2
-    assert video_duration_seconds == pytest.approx(desired_video_duration, 0.5)
+        desired_video_duration *= 2.0
+        desired_video_duration /= appconfig.actions.video[0].processing.boomerang_speed
+    assert video_duration_seconds == pytest.approx(desired_video_duration, abs=0.5)
 
 
 def test_multicamera(_container: Container):
+    fileformat_should = appconfig.mediaprocessing.fileformat_multicamera
     number_of_images_before = _container.mediacollection_service.count()
 
     _container.processing_service.trigger_action("multicamera", 0)
@@ -187,3 +214,14 @@ def test_multicamera(_container: Container):
     assert _container.processing_service._workflow_jobmodel is None
 
     assert _container.mediacollection_service.count() == number_of_images_before + 5
+
+    phase2_item = _container.mediacollection_service.get_item_latest()
+    assert phase2_item.processed.suffix.lower() == f".{fileformat_should}"
+
+    # ensure written video is about in tolerance duration
+    if fileformat_should == "mp4":
+        video_duration_seconds = abs(round(video_duration(phase2_item.processed), 1))
+        assert video_duration_seconds > 0.1
+    else:
+        with Image.open(phase2_item.processed, formats=["GIF", "AVIF", "WEBP"]) as img:
+            img.verify()

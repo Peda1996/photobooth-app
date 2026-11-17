@@ -1,27 +1,22 @@
-"""
-abstract for the photobooth-app backends
-"""
-
-import io
 import logging
-import os
-import subprocess
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event
+from typing import Literal
 
-import piexif
+from photobooth.utils.stoppablethread import StoppableThread
 
-from ... import LOG_PATH
-from ...appconfig import appconfig
-from ...utils.stoppablethread import StoppableThread
-from ..config.groups.backends import Orientation
+from ...utils.resilientservice import ResilientService
+from ..config.groups.cameras import Orientation
+from .utils.rotate_exif import set_exif_orientation
 
 logger = logging.getLogger(__name__)
+
+Modes = Literal["still", "video", "standby"]
 
 
 @dataclass
@@ -31,20 +26,13 @@ class BackendStats:
     if not, may be 0 or None
     """
 
-    backend_name: str = __name__
-
-    fps: int | None = None
-    exposure_time_ms: float | None = None
-    lens_position: float | None = None
-    again: float | None = None
-    dgain: float | None = None
-    lux: float | None = None
-    colour_temperature: int | None = None
-    sharpness: int | None = None
+    backend_name: str
+    mode: str
+    device_fps: int
 
 
 @dataclass
-class GeneralBytesResult:
+class LoresBroadcastRes:
     # jpeg data as bytes
     data: bytes
     # condition when frame is avail
@@ -52,444 +40,364 @@ class GeneralBytesResult:
 
 
 @dataclass
-class GeneralFileResult:
-    # jpeg data file for hires
-    filepath: Path | None
-    # signal to producer that requesting thread is ready to be notified
-    request: threading.Event
-    # condition when frame is avail
-    condition: threading.Condition
+class StillRequest:
+    id: uuid.UUID
+    subdevice_index: int
+    result_file: Path | None = None
+    # error: Exception | None = None
+    condition: threading.Condition = threading.Condition()
 
 
 @dataclass
-class GeneralMultifileResult:
-    # jpeg data file for hires
-    filepath: list[Path] | None
-    # signal to producer that requesting thread is ready to be notified
-    request: threading.Event
-    # condition when frame is avail
-    condition: threading.Condition
+class MulticamRequest:
+    id: uuid.UUID
+    result_files: list[Path] | None = None
+    # error: Exception | None = None
+    condition: threading.Condition = threading.Condition()
 
 
 @dataclass
 class Framerate:
-    """helps calculating the current framerate of backend.
-    init empty and on every frame delivered, set current_timestamp with monotonic_ns() value
-    when two timestamps are avail, the fps can be read from .fps
+    """Thread-safe rolling-window FPS calculator."""
 
-    Returns:
-        int: Framerate
-    """
+    _timestamps: deque[int] = field(default_factory=lambda: deque(maxlen=5))
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    _last_timestamp: int | None = None
-    _current_timestamp: int | None = None
-
-    @property
-    def current_timestamp(self) -> int | None:
-        return self._current_timestamp
-
-    @current_timestamp.setter
-    def current_timestamp(self, v: int) -> None:
-        self._last_timestamp = self._current_timestamp
-        self._current_timestamp = v
+    def add_frame(self) -> None:
+        with self._lock:
+            self._timestamps.append(time.monotonic_ns())
 
     @property
     def fps(self) -> int:
-        if self._last_timestamp and self._current_timestamp:
-            return int(round(1.0 / ((self._current_timestamp - self._last_timestamp) * 1.0e-9), 0))
-        else:
-            return 0
+        with self._lock:
+            # need at least 2 timestamps for fps calc
+            if len(self._timestamps) < 2:
+                return 0
+
+            # invalidate outdated fps data after 1 sec of no frame received
+            elapsed_since_last_add_frame = (time.monotonic_ns() - self._timestamps[-1]) * 1e-9
+            if elapsed_since_last_add_frame > 1:
+                self._timestamps.clear()
+
+                return 0
+
+            deltas = [self._timestamps[i] - self._timestamps[i - 1] for i in range(1, len(self._timestamps))]
+
+        avg_delta_ns = sum(deltas) / len(deltas)
+        return int(round(1.0 / (avg_delta_ns * 1e-9), 0))
+
+    def _remaining_ns(self, target_fps: int) -> int:
+        """
+        Return remaining nanoseconds until the next frame should be processed.
+        Positive → too early (should wait or skip)
+        Zero/negative → OK to process now
+        """
+        if target_fps <= 0:
+            return 0  # unlimited FPS
+
+        target_delta_ns = int(1e9 / target_fps)
+
+        with self._lock:
+            if not self._timestamps:
+                return 0  # no history → allow first frame
+            last_ts = self._timestamps[-1]
+
+        now = time.monotonic_ns()
+        elapsed = now - last_ts
+        return target_delta_ns - elapsed
+
+    def wait_until_fps(self, target_fps: int) -> None:
+        """public api, blocking"""
+        remaining = self._remaining_ns(target_fps)
+        if remaining > 0:
+            time.sleep(remaining / 1e9)
+
+    def should_process_frame(self, target_fps: int) -> bool:
+        """public api, non-blocking"""
+        # TODO: validate 0.5 tolerance.
+        return self._remaining_ns(target_fps) <= int(0.5e9 / target_fps)
 
 
-class AbstractBackend(ABC):
+class ModeController:
+    """
+    Einfacher Mode-Controller mit:
+    - requested_mode (Thread-agnostisch)
+    - active_mode (nur im Stream-Thread gesetzt)
+    - automatischem Standby nach Idle
+    """
+
+    def __init__(self, backend: "AbstractBackend", idle_timeout: float | None = None):
+        self.backend = backend
+        self.idle_timeout = idle_timeout
+
+        # schützt intern den mode-wechsel intern
+        self._int_lock = threading.Lock()
+        # schützt wenn extern acquired damit der modus garantiert bleibt und kein idle timeout oder livepreview request dazwischen geht
+        # der R-lock kann mehrfach genommen werden VOM SELBEN THREAD.
+        # das ist was wir brauchen um den mode request abzusetzen und dann im camera thread zu wechseln
+        self.ext_mode_switch_lock = threading.RLock()
+
+        self.requested_mode: Modes = "standby"
+        self.active_mode: Modes | None = None
+        self._last_live_request: float | None = time.monotonic()
+        self._monitor_thread: StoppableThread | None = None
+
+    def start(self):
+        if self.idle_timeout:
+            assert self.idle_timeout > 5, "The idle timeout to set the camera to standby needs to be disabled or at least 5s."
+
+            self._monitor_thread = StoppableThread(name="modecontroller_monitor", target=self._idle_monitor, daemon=True)
+            self._monitor_thread.start()
+
+    def stop(self):
+        if self._monitor_thread:
+            self._monitor_thread.stop()
+            self._monitor_thread.join()
+
+    # ---------------------------------------------------------
+    # Öffentliche API (kann aus jedem Thread aufgerufen werden)
+    # ---------------------------------------------------------
+
+    def request_mode(self, mode: Modes):
+        with self._int_lock:
+            self.requested_mode = mode
+
+    def request_video(self):
+        """usually requested when creating a video but also for livestream. livestream request video on every frame to reset the timer.
+        the stream thread needs to ensure a still capture is not interupted by another request to video!"""
+        with self._int_lock:
+            self._last_live_request = time.monotonic()
+            self.requested_mode = "video"
+
+    def request_still(self):
+        with self._int_lock:
+            self._last_live_request = time.monotonic()
+            self.requested_mode = "still"
+
+    def request_standby(self):
+        self.request_mode("standby")
+
+    def request_standby_if_not_video_requested(self):
+        with self._int_lock:
+            if self.requested_mode == "video":
+                return
+
+            self.requested_mode = "standby"
+
+    def reset_standby_timer(self):
+        with self._int_lock:
+            self._last_live_request = time.monotonic()
+
+    @property
+    def is_mode_change_pending(self):
+        return self.requested_mode != self.active_mode
+
+    def _idle_monitor(self):
+        """Monitor thread function to request standby if no livestream is requested for idle_timeout seconds"""
+        assert self.idle_timeout
+        assert self._monitor_thread
+
+        logger.info(f"pausing livestream on backend {self.backend} after {self.idle_timeout}s is enabled.")
+
+        while not self._monitor_thread.stopped():
+            time.sleep(1)
+
+            should_standby = False
+            with self._int_lock:
+                if self._last_live_request is not None:
+                    idle = time.monotonic() - self._last_live_request
+                    if idle > self.idle_timeout and self.active_mode in ("video", "still"):
+                        self._last_live_request = None
+                        self.requested_mode = "standby"
+                        should_standby = True
+
+            if should_standby:
+                logger.info(f"pause camera stream after {self.idle_timeout} idle timeout.")
+
+    def process_switchmode(self, immediate_forced_mode: Modes | None = None):
+        """Wird im stream-thread aufgerufen, wenn es passend für einen potentiellen mode-switch ist"""
+
+        # Wenn extern freeze aktiv → kein mode switch, ext_lock ist ein RLock, der vom aufrufenden thread genommen wird und hier
+        # erst wenn beide frei sind, ist ein neuer mode-wechsel möglich.
+
+        with self.ext_mode_switch_lock:
+            with self._int_lock:
+                if immediate_forced_mode:
+                    self.requested_mode = immediate_forced_mode
+
+                req = self.requested_mode
+                act = self.active_mode
+
+                # Kein Modewechsel nötig
+                if req == act:
+                    return
+
+                # if act is None, in every case run the init handle first
+                # this ensures on first call of process_switchmode the device
+                # is initialized with the desired params properly.
+                if act is None:
+                    logger.info(f"camera not yet configured after startup, apply device init config now on backend {self.backend}")
+                    self.backend._handle_switchmode_init()
+
+                logger.info(f"changing mode from {act} to {req} on backend {self.backend}")
+
+                # Modewechsel durchführen
+                if req == "video":
+                    self.backend._handle_switchmode_video_mode()
+                elif req == "still":
+                    self.backend._handle_switchmode_still_mode()
+                elif req == "standby":
+                    self.backend._handle_switchmode_standby()
+
+                # Mode ist jetzt aktiv
+                self.active_mode = req
+
+                logger.info("changing mode completed")
+
+
+class AbstractBackend(ResilientService, ABC):
     @abstractmethod
-    def __init__(self, orientation: Orientation = "1: 0°"):
+    def _handle_switchmode_init(self):
+        """called during device setup"""
+
+    @abstractmethod
+    def _handle_switchmode_standby(self):
+        """called internally by supervising if liveview frames are requested"""
+
+    @abstractmethod
+    def _handle_switchmode_video_mode(self):
+        """called externally via events and used to change to a preview mode if necessary"""
+
+    @abstractmethod
+    def _handle_switchmode_still_mode(self):
+        """called externally via events and used to change to a capture mode if necessary"""
+
+    @abstractmethod
+    def __init__(self, orientation: Orientation, num_subdevices: int, idle_timeout: float | None):
         # init
         self._orientation: Orientation = orientation
+        self._num_subdevices = num_subdevices
+        self._idle_timeout = idle_timeout
+        self.is_video_backend = True
 
         # statisitics attributes
-        self._backendstats: BackendStats = BackendStats(backend_name=self.__class__.__name__)
         self._framerate: Framerate = Framerate()
 
-        # flat that the actual backend implementation sets via set_is_ready_to_deliver, when the backend can deliver safely
-        # images within a usual timeout period.
-        self.is_ready_to_deliver: Event = Event()
-        self.is_marked_faulty: Event = Event()
+        self._mode_machine = ModeController(self, idle_timeout=self._idle_timeout)
 
-        # used to indicate if the app requires this backend to deliver actually lores frames (live-backend or only one main backend)
-        # default is to assume it's not responsible to deliver frames. once wait_for_lores_image is called, this is set to true.
-        # the backend-implementation has to decide how to handle this once True.
-        self._device_enable_lores_flag: bool = False
-
-        # video feature
-        self._video_worker_capture_started: Event = Event()
-        self._video_worker_thread: StoppableThread | None = None
-        self._video_recorded_videofilepath: Path | None = None
-        self._video_framerate: int | None = None
+        # lores broadcast and ...
+        self._lores_data = [LoresBroadcastRes(data=b"", condition=threading.Condition()) for _ in range(self._num_subdevices)]
+        # ... hires queue
+        self._hires_queue: deque[StillRequest | MulticamRequest] = deque(maxlen=1)
+        self._hires_lock = threading.Lock()
 
         super().__init__()
 
+    def __str__(self):
+        return f"{self.__class__.__name__}"
+
     def __repr__(self):
-        return f"{self.__class__}"
+        return f"{self.__class__.__name__}"
 
     def get_stats(self) -> BackendStats:
-        self._backendstats.fps = self._framerate.fps
-        return self._backendstats
+        base = BackendStats(
+            backend_name=self.__class__.__name__,
+            mode=self._mode_machine.active_mode or "unknown",
+            device_fps=self._framerate.fps,
+        )
+
+        return self._extend_stats(base)
+
+    def _extend_stats(self, base: BackendStats) -> BackendStats:
+        return base  # default: no extension, otherwise override in the backend
 
     def _frame_tick(self):
         """call by backends implementation when frame is delivered, so the fps can be calculated..."""
-        self._framerate.current_timestamp = time.monotonic_ns()
+        self._framerate.add_frame()
 
     @abstractmethod
     def start(self):
         """To start the backend to serve"""
-        logger.debug(f"{self.__module__} start called")
-
-        # reset the request for this backend to deliver lores frames
-        self._device_enable_lores_flag = False
-        self._device_set_is_ready_to_deliver(False)
-        self.is_marked_faulty.clear()
+        self._mode_machine.start()
+        super().start()
 
     @abstractmethod
     def stop(self):
         """To stop the backend to serve"""
-        logger.debug(f"{self.__module__} stop called")
+        self._mode_machine.stop()
+        super().stop()
 
-        self._device_set_is_ready_to_deliver(False)
-        self.is_marked_faulty.clear()
-        self.stop_recording()
+    def wait_for_multicam_files(self) -> list[Path]:
+        if self._num_subdevices < 2:
+            raise RuntimeError(f"cannot get multicam files as {self} has only {self._num_subdevices} subdevices but needs at least 2.")
 
-    @abstractmethod
-    def _device_alive(self) -> bool:
-        # no threads to supervise here.
-        return True
+        req = MulticamRequest(uuid.uuid4())
 
-    def _device_set_is_ready_to_deliver(self, flag: bool = True):
-        """
-        called by backend, when ready to deliver frames or not any more
-        """
-        if flag:
-            self.is_ready_to_deliver.set()
-        else:
-            self.is_ready_to_deliver.clear()
+        self._mode_machine.request_still()
 
-        logger.info(f"device signals is ready to deliver now={flag}")
+        with self._hires_lock:
+            self._hires_queue.append(req)
 
-    def block_until_device_is_running(self):
-        """Mostly used for testing to ensure the device is up.
+        with req.condition:
+            ok = req.condition.wait(timeout=8)
 
-        Returns:
-            _type_: _description_
-        """
-        timeout = 10
-        logger.info(f"waiting for device to be ready to deliver until timeout={timeout}s")
-        if not self.is_ready_to_deliver.wait(timeout=timeout):
-            raise RuntimeError("Error, device not signaling ready until timeout occured!")
+            if not ok:
+                raise TimeoutError("timeout waiting for hires frame")
 
-        logger.debug("continue, device signaled is ready to deliver")
+            filepaths = req.result_files
+            assert filepaths
 
-    def rotate_jpeg_file_by_exif_flag(self, filepath: Path, orientation_choice: Orientation):
-        """inserts updated orientation flag in given filepath.
-        ref https://sirv.com/help/articles/rotate-photos-to-be-upright/
+            for filepath in filepaths:
+                set_exif_orientation(filepath, self._orientation)
 
-        Args:
-            filepath (Path): file to modify
-            orientation_value (int): Orientierung (1=0°, 3=180°, 5=90°, 7=270°)
-        """
-        piexif.insert(self._get_updated_exif_bytes(str(filepath), orientation_choice), str(filepath))
+            return filepaths
 
-    def rotate_jpeg_data_by_exif_flag(self, image_data: bytes, orientation_choice: Orientation):
-        """reads exif from image_data bytes and returns new bytes with updated orientation.
-        ref: https://sirv.com/help/articles/rotate-photos-to-be-upright/
+    def wait_for_still_file(self, index_subdevice: int = 0) -> Path:
+        req = StillRequest(uuid.uuid4(), subdevice_index=index_subdevice)
 
-        Args:
-            image_data (bytes): data to modify
-            orientation_value (int): Orientierung (0=0°, 3=180°, 5=90°, 7=270°)
-        """
-        output = io.BytesIO()
-        piexif.insert(self._get_updated_exif_bytes(image_data, orientation_choice), image_data, output)
+        self._mode_machine.request_still()
 
-        return output.getvalue()
+        with self._hires_lock:
+            self._hires_queue.append(req)
 
-    def _get_updated_exif_bytes(self, maybe_image, orientation_choice: Orientation):
-        assert isinstance(orientation_choice, str)
+        with req.condition:
+            ok = req.condition.wait(timeout=8)
 
-        orientation = int(orientation_choice[0])
-        if 1 < orientation > 8:
-            raise ValueError(f"invalid orientation choice {orientation_choice} results in invalid value: {orientation}.")
+            if not ok:
+                raise TimeoutError("timeout waiting for hires frame")
 
-        exif_dict = piexif.load(maybe_image)
-        exif_dict["0th"][piexif.ImageIFD.Orientation] = orientation
+            filepath = req.result_file
+            assert filepath
 
-        return piexif.dump(exif_dict)
+            set_exif_orientation(filepath, self._orientation)
 
-    def wait_for_multicam_files(self, retries: int = 3) -> list[Path]:
-        """
-        function blocks until high quality image is available
-        """
+            return filepath
 
-        for attempt in range(1, retries + 1):
-            try:
-                return self._wait_for_multicam_files()
-            except NotImplementedError:
-                # backend does not support, immediately reraise and done.
-                raise
-            except Exception as exc:
-                logger.exception(exc)
-                logger.error(f"error capture image. {attempt=}/{retries}, retrying")
-                continue
+    def wait_for_lores_image(self, index_subdevice: int = 0) -> bytes:
 
-        else:
-            # we failed finally all the attempts - deal with the consequences.
-            self.is_marked_faulty.set()  # mark the backend as faulty, so it will be restarted from outer service
-            logger.critical(f"finally failed after {retries} attempts to capture image!")
-            raise RuntimeError(f"finally failed after {retries} attempts to capture image!")
+        if index_subdevice > len(self._lores_data):
+            raise RuntimeError(f"streaming from subdevice={index_subdevice} not possible because there are only {len(self._lores_data)} available.")
 
-    def wait_for_still_file(self, retries: int = 3) -> Path:
-        """
-        function blocks until high quality image is available
-        """
+        self._mode_machine.request_video()
 
-        for attempt in range(1, retries + 1):
-            try:
-                filepath = self._wait_for_still_file()
-                self.rotate_jpeg_file_by_exif_flag(filepath, self._orientation)
-                return filepath
-            except Exception as exc:
-                logger.exception(exc)
-                logger.error(f"error capture image. {attempt=}/{retries}, retrying")
-                continue
+        with self._lores_data[index_subdevice].condition:
+            if not self._lores_data[index_subdevice].condition.wait(timeout=2.0):
+                raise TimeoutError("timeout receiving frames")
 
-        else:
-            # we failed finally all the attempts - deal with the consequences.
-            self.is_marked_faulty.set()  # mark the backend as faulty, so it will be restarted from outer service
-            logger.critical(f"finally failed after {retries} attempts to capture image!")
-            raise RuntimeError(f"finally failed after {retries} attempts to capture image!")
+            img = self._lores_data[index_subdevice].data
 
-    def wait_for_lores_image(self, retries: int = 10):
-        """Function called externally to receivea low resolution image.
-        Also used to stream. Tries to recover up to retries times before giving up.
+            img = set_exif_orientation(img, self._orientation)
 
-        Args:
-            retries (int, optional): How often retry to use the private _wait_for_lores_image function before failing. Defaults to 10.
-
-        Raises:
-            exc: Shutdown is handled different, no retry
-            exc: All other exceptions will lead to retry before finally fail.
-
-        Returns:
-            _type_: _description_
-        """
-        self._device_enable_lores_flag = True
-
-        for _ in range(1, retries):
-            try:
-                img_bytes = self._wait_for_lores_image()  # blocks 0.5s usually. 10 retries default wait time=5s
-                img = self.rotate_jpeg_data_by_exif_flag(img_bytes, self._orientation)
-                return img
-            except TimeoutError as exc:
-                if self._device_alive():
-                    continue
-                else:
-                    logger.debug("device not alive any more, stopping early lores image delivery.")
-                    raise StopIteration from exc
-            except Exception as exc:
-                # other exceptions fail immediately
-                logger.warning("device raised exception (maybe lost connection to device?)")
-                raise RuntimeError("device raised exception (maybe lost connection to device?)") from exc
-
-        logger.debug(f"device timed out deliver lores image in {retries - 1} attempts. One last try now or raise exception.")
-
-        # final call
-        try:
-            return self._wait_for_lores_image()  # blocks 0.5s usually. 10 retries default wait time=5s
-        except Exception as exc:
-            # we failed finally all the attempts - deal with the consequences.
-            logger.exception(exc)
-            logger.critical(f"finally failed after {retries} attempts to capture lores image!")
-
-            # mark the backend as faulty, so it will be restarted from outer service
-            self.is_marked_faulty.set()
-            logger.error("failing to get lores images from device is considered as error, stopping backend to recover")
-
-            raise RuntimeError("device raised exception") from exc
-
-    def start_recording(self, video_framerate: int) -> Path:
-        self._video_worker_capture_started.clear()
-        self._video_framerate = video_framerate
-
-        # generate temp filename to record to
-        mp4_output_filepath = Path("tmp", f"{self.__class__.__name__}_{uuid.uuid4().hex}").with_suffix(".mp4")
-
-        self._video_worker_thread = StoppableThread(name="_videoworker_fun", target=self._videoworker_fun, args=(mp4_output_filepath,), daemon=True)
-        self._video_worker_thread.start()
-
-        tms = time.time()
-        # gives 3 seconds to actually capture with ffmpeg, otherwise timeout. if ffmpeg is not in memory it needs time to load from disk
-        if not self._video_worker_capture_started.wait(timeout=3):
-            logger.warning("ffmpeg could not start within timeout; cpu too slow?")
-        logger.debug(f"-- ffmpeg startuptime: {round((time.time() - tms), 2)}s ")
-
-        return mp4_output_filepath
-
-    def is_recording(self):
-        return self._video_worker_thread is not None and self._video_worker_capture_started.is_set()
-
-    def stop_recording(self):
-        # clear notifier that capture was started
-        self._video_worker_capture_started.clear()
-
-        if self._video_worker_thread:
-            logger.debug("stop recording")
-            self._video_worker_thread.stop()
-            self._video_worker_thread.join()
-            logger.info("_video_worker_thread stopped and joined")
-
-        else:
-            logger.info("no _video_worker_thread active that could be stopped")
-
-    def _videoworker_fun(self, mp4_output_filepath: Path):
-        logger.info("_videoworker_fun start")
-        # init worker, set output to None which indicates there is no current video available to get
-        self._video_recorded_videofilepath = None
-
-        command_general_options = [
-            "-hide_banner",
-            "-loglevel",
-            "info",
-            "-y",
-        ]
-        command_video_input = [
-            "-use_wallclock_as_timestamps",
-            "1",
-            "-thread_queue_size",
-            "64",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-i",
-            "-",
-        ]
-        command_video_output = [
-            "-vcodec",
-            "libx264",  # warning! image height must be divisible by 2! #there are also hw encoder avail: https://stackoverflow.com/questions/50693934/different-h264-encoders-in-ffmpeg
-            "-preset",
-            "veryfast",
-            "-b:v",
-            f"{appconfig.mediaprocessing.video_bitrate}k",
-            "-movflags",
-            "+faststart",
-            "-r",
-            f"{self._video_framerate}",
-        ]
-        command_video_output_compat_mode = []
-        if appconfig.mediaprocessing.video_compatibility_mode:
-            # fixes #233. needs more cpu and seems deprecated, maybe in future it will be configurable to disable
-            command_video_output_compat_mode = [
-                "-pix_fmt",
-                "yuv420p",
-            ]
-
-        ffmpeg_command = (
-            ["ffmpeg"]
-            + command_general_options
-            + command_video_input
-            + command_video_output
-            + command_video_output_compat_mode
-            + [str(mp4_output_filepath)]
-        )
-
-        try:
-            ffmpeg_subprocess = subprocess.Popen(
-                ffmpeg_command,
-                stdin=subprocess.PIPE,
-                # following report is workaround to avoid deadlock by pushing too much output in stdout/err
-                # https://thraxil.org/users/anders/posts/2008/03/13/Subprocess-Hanging-PIPE-is-your-enemy/
-                env=dict(os.environ, FFREPORT=f"file={LOG_PATH}/ffmpeg-last.log:level=32"),
-                # stdout=subprocess.PIPE,
-                # stderr=subprocess.STDOUT,
-            )
-            assert ffmpeg_subprocess.stdin
-        except Exception as exc:
-            logger.error(f"starting ffmpeg failed: {exc}")
-            return
-
-        logger.info("writing to ffmpeg stdin")
-        tms = time.time()
-
-        # inform calling function, that ffmpeg received first image now
-        self._video_worker_capture_started.set()
-
-        assert self._video_worker_thread
-        while not self._video_worker_thread.stopped():
-            try:
-                # retry with a low number because video would be messed anyways if needs to retry
-                ffmpeg_subprocess.stdin.write(self.wait_for_lores_image(retries=4))
-                ffmpeg_subprocess.stdin.flush()  # forces every frame to get timestamped individually
-            except Exception as exc:  # presumably a BrokenPipeError? should we check explicitly?
-                ffmpeg_subprocess = None
-                logger.exception(exc)
-                logger.error(f"Failed to create video! Error: {exc}")
-
-                self._video_worker_thread.stop()
-                break
-
-        if ffmpeg_subprocess is not None:
-            logger.info("writing to ffmpeg stdin finished")
-            logger.debug(f"-- process time: {round((time.time() - tms), 2)}s ")
-
-            # release final video processing
-            tms = time.time()
-
-            _, ffmpeg_stderr = ffmpeg_subprocess.communicate()  # send empty to stdin, indicates close and gets stderr/stdout; shut down tidily
-            code = ffmpeg_subprocess.wait()  # Give it a moment to flush out video frames, but after that make sure we terminate it.
-
-            if code != 0:
-                logger.error(ffmpeg_stderr)  # can help to track down errors for non-zero exitcodes.
-
-                logger.error(f"error creating videofile, ffmpeg exit code ({code}).")
-                # note: there is more information in ffmpeg logfile: ffmpeg-last.log
-
-            ffmpeg_subprocess = None
-
-            logger.info("ffmpeg finished")
-            logger.debug(f"-- process time: {round((time.time() - tms), 2)}s ")
-
-            logger.info(f"record written to {mp4_output_filepath}")
-
-        logger.info("leaving _videoworker_fun")
-
-    #
-    # ABSTRACT METHODS TO BE IMPLEMENTED BY CONCRETE BACKEND (cv2, v4l, ...)
-    #
+            return img
 
     @abstractmethod
-    def _wait_for_multicam_files(self) -> list[Path]:
-        """
-        function blocks until image still is available
-        """
+    def setup_resource(self):
+        pass
 
     @abstractmethod
-    def _wait_for_still_file(self) -> Path:
-        """
-        function blocks until image still is available
-        """
+    def teardown_resource(self):
+        pass
 
     @abstractmethod
-    def _wait_for_lores_image(self) -> bytes:
-        """
-        function blocks until frame is available for preview stream
-        """
-
-    @abstractmethod
-    def _on_configure_optimized_for_idle(self):
-        """called externally via events and used to change to a preview mode if necessary"""
-
-    @abstractmethod
-    def _on_configure_optimized_for_hq_preview(self):
-        """called externally via events and used to change to a preview mode if necessary"""
-
-    @abstractmethod
-    def _on_configure_optimized_for_hq_capture(self):
-        """called externally via events and used to change to a capture mode if necessary"""
+    def run_service(self):
+        pass

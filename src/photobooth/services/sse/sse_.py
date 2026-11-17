@@ -1,37 +1,40 @@
-"""
-_summary_
-"""
-
 import asyncio
 import json
 import logging
 import os
 import time
 import uuid
-from asyncio import Queue, QueueFull
+from abc import abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fastapi import Request
+from pydantic import BaseModel
 from sse_starlette.event import ServerSentEvent
-from statemachine import State
 
-from ...database.schemas import MediaitemPublic
-from ..processor.base import JobModelBase
+from photobooth.services.processor.base import UiJobModel
+
+from ...database.schemas import MediaitemPublic, ShareLimitsPublic, UsageStatsPublic
+from ...models.genericstats import GenericStats
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SseEventBase:
+class SseEventBase(BaseModel):
     """basic class for sse events"""
 
-    # event: str
-    # data: str
+    @property
+    @abstractmethod
+    def event(self) -> str:
+        pass
+
+    @property
+    @abstractmethod
+    def data(self) -> str:
+        pass
 
 
-@dataclass
 class SseEventTranslateableFrontendNotification(SseEventBase):
     """some visible message in frontend"""
 
@@ -41,80 +44,71 @@ class SseEventTranslateableFrontendNotification(SseEventBase):
     icon: str | None = None  # could a quasar icon or None, the UI default
     spinner: bool | None = None  # could be True or False, None same as False
 
-    event: str = "TranslateableFrontendNotification"
+    @property
+    def event(self) -> str:
+        return "TranslateableFrontendNotification"
 
     @property
     def data(self) -> str:
-        return json.dumps(
-            dict(
-                message_key=self.message_key,
-                context_data=self.context_data,
-                color=self.color,
-                icon=self.icon,
-                spinner=self.spinner,
-            )
-        )
+        return self.model_dump_json()
 
 
-@dataclass
 class SseEventProcessStateinfo(SseEventBase):
     """_summary_"""
 
-    source: State
-    target: State
-    jobmodel: JobModelBase | None
+    source: str | None
+    target: str | None
+    jobmodel: UiJobModel | None
 
-    event: str = "ProcessStateinfo"
+    @property
+    def event(self) -> str:
+        return "ProcessStateinfo"
 
     @property
     def data(self) -> str:
-        # logger.debug(self.jobmodel.export()
-        if self.jobmodel:
-            return json.dumps(
-                dict(
-                    source=self.source.id,
-                    target=self.target.id,
-                    jobmodel=self.jobmodel.export(),
-                )
-            )
+        # either have it all or nothing
+        if self.jobmodel and self.source and self.target:
+            return self.model_dump_json()
         else:
             return json.dumps({})
 
 
-@dataclass
 class SseEventDbInsert(SseEventBase):
     mediaitem: MediaitemPublic
 
-    event: str = "DbInsert"
+    @property
+    def event(self) -> str:
+        return "DbInsert"
 
     @property
     def data(self) -> str:
         return self.mediaitem.model_dump_json()
 
 
-@dataclass
 class SseEventDbUpdate(SseEventBase):
     mediaitem: MediaitemPublic
 
-    event: str = "DbUpdate"
+    @property
+    def event(self) -> str:
+        return "DbUpdate"
 
     @property
     def data(self) -> str:
         return self.mediaitem.model_dump_json()
 
 
-@dataclass
 class SseEventDbRemove(SseEventBase):
     mediaitem: MediaitemPublic
 
-    event: str = "DbRemove"
+    @property
+    def event(self) -> str:
+        return "DbRemove"
 
     @property
     def data(self) -> str:
         return self.mediaitem.model_dump_json()
 
 
-@dataclass
 class SseEventLogRecord(SseEventBase):
     """basic class for sse events"""
 
@@ -126,24 +120,15 @@ class SseEventLogRecord(SseEventBase):
     lineno: str
     # display_notification: bool
 
-    event: str = "LogRecord"
+    @property
+    def event(self) -> str:
+        return "LogRecord"
 
     @property
     def data(self) -> str:
-        return json.dumps(
-            dict(
-                time=self.time,
-                level=self.level,
-                message=self.message,
-                name=self.name,
-                funcName=self.funcName,
-                lineno=self.lineno,
-                # display_notification=self.display_notification,
-            )
-        )
+        return self.model_dump_json()
 
 
-@dataclass
 class SseEventOnetimeInformationRecord(SseEventBase):
     """basic class for sse events"""
 
@@ -157,60 +142,39 @@ class SseEventOnetimeInformationRecord(SseEventBase):
     model: str
     data_directory: Path
     python_executable: str
-    disk: dict[str, Any]
+    disk: dict[str, int | float]
 
-    event: str = "InformationRecord"
+    @property
+    def event(self) -> str:
+        return "OnetimeInformationRecord"
 
     @property
     def data(self) -> str:
-        return json.dumps(
-            dict(
-                version=self.version,
-                platform_system=self.platform_system,
-                platform_release=self.platform_release,
-                platform_machine=self.platform_machine,
-                platform_python_version=self.platform_python_version,
-                platform_node=self.platform_node,
-                platform_cpu_count=self.platform_cpu_count,
-                model=self.model,
-                data_directory=str(self.data_directory),
-                python_executable=self.python_executable,
-                disk=self.disk,
-            )
-        )
+        return self.model_dump_json()
 
 
-@dataclass
 class SseEventIntervalInformationRecord(SseEventBase):
     """basic class for sse events"""
 
     cpu_percent: float
-    memory: dict[str, Any]
-    cma: dict[str, Any]
+    memory: dict[str, int | float]
+    cma: dict[str, int | None] | dict[str, None]
     backends: dict[str, dict[str, Any]]
-    stats_counter: list[dict[str, Any]]
-    limits_counter: list[dict[str, Any]]
+    stats_counter: list[UsageStatsPublic]
+    limits_counter: list[ShareLimitsPublic]
     battery_percent: int | None
     temperatures: dict[str, Any]
     mediacollection: dict[str, Any]
+    plugins: list[GenericStats]
+    pi_throttled_flags: dict[str, bool]
 
-    event: str = "InformationRecord"
+    @property
+    def event(self) -> str:
+        return "IntervalInformationRecord"
 
     @property
     def data(self) -> str:
-        return json.dumps(
-            dict(
-                cpu_percent=self.cpu_percent,
-                memory=self.memory,
-                cma=self.cma,
-                backends=self.backends,
-                stats_counter=self.stats_counter,
-                limits_counter=self.limits_counter,
-                battery_percent=self.battery_percent,
-                temperatures=self.temperatures,
-                mediacollection=self.mediacollection,
-            )
-        )
+        return self.model_dump_json()
 
 
 @dataclass
@@ -218,7 +182,7 @@ class Client:
     """Class each individual client connected"""
 
     request: Request
-    queue: Queue
+    queue: asyncio.Queue[ServerSentEvent]
 
 
 class SseService:
@@ -226,16 +190,22 @@ class SseService:
         # keep track of client connections with each individual request and queue.
         self._clients: list[Client] = []
 
+        # on app end a shutdown is requested to stop yielding and so disconnet live sse connections.
+        # without stop yielding, uvcorn would wait infinite until all clients close the connection, which they do not do
+        self._shutdown: bool = False
+
+    def request_shutdown(self):
+        # shutdown request is one way - the app will not recover from this but needs a restart to resume
+        logger.debug("sse service shutdown requested to stop yielding messages")
+        self._shutdown = True
+
     def setup_client(self, client: Client):
         self._clients.append(client)
-        logger.info(f"SSE subscription added for client {client.request.client}")
-        logger.debug(f"SSE clients listed {[_client.request for _client in self._clients]}")
+        logger.debug(f"SSE clients connected: {[_client.request.client for _client in self._clients]}")
         # print(f"client.queue {[client.queue for client in self._clients]}")
         # print(f"qsize {[client.queue.qsize() for client in self._clients]}")
 
     def remove_client(self, client: Client):
-        logger.debug(f"SSE subscription remove for {client.request.client} requested")
-
         # iterate over client list and remove.
         for index, _client in enumerate(self._clients):
             if _client.request is client.request:
@@ -243,9 +213,9 @@ class SseService:
                 logger.debug(f"SSE subscription removed for {removed_client.request.client}")
                 break
 
-        logger.debug(f"SSE clients listed {[_client.request for _client in self._clients]}")
+        logger.debug(f"SSE clients connected: {[_client.request.client for _client in self._clients]}")
 
-    def dispatch_event(self, sse_event_data):
+    def dispatch_event(self, sse_event_data: SseEventBase):
         for client in self._clients:
             try:
                 client.queue.put_nowait(
@@ -257,12 +227,12 @@ class SseService:
                     )
                 )
 
-            except QueueFull:
+            except asyncio.QueueFull:
                 # fail in silence if queue is full - though is critical for init sse messages.
                 # on the other side, queue better not infinite if disconnect is not working proper and queue remains getting larger
                 pass
 
-    async def event_iterator(self, client: Client, timeout=0.0):
+    async def event_iterator(self, client: Client, timeout: float = 0.0):
         if "PYTEST_CURRENT_TEST" in os.environ:
             # FIXME: workaround for testing until testing with mocks/patching works well...
             timeout = 3.5
@@ -274,7 +244,11 @@ class SseService:
                 if await client.request.is_disconnected():
                     self.remove_client(client)
                     logger.info(f"client request disconnect, client {client.request.client}")
-                    return
+                    break
+
+                if self._shutdown:
+                    logger.info("Shutdown requested, stopping event_iterator")
+                    break
 
                 try:
                     yield await asyncio.wait_for(client.queue.get(), timeout=0.5)
@@ -288,3 +262,8 @@ class SseService:
 
             # https://stackoverflow.com/a/53724990
             raise exc
+
+        finally:
+            # Cleanup always happens
+            logger.info(f"Cleaning up stream {client.request.client}")
+            self.remove_client(client)

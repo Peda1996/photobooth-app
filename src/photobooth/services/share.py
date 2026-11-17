@@ -1,13 +1,16 @@
 import logging
 import subprocess
 from datetime import datetime
+from typing import cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import CursorResult, delete, select
 from sqlalchemy.orm import Session
 
 from ..appconfig import appconfig
 from ..database.database import engine
 from ..database.models import Mediaitem, ShareLimits
+from ..utils.exceptions import WrongMediaTypeError
+from ..utils.printer import PrinterStatus, get_printer_status
 from .base import BaseService
 from .sse import sse_service
 from .sse.sse_ import SseEventTranslateableFrontendNotification
@@ -20,20 +23,12 @@ class ShareService(BaseService):
     def __init__(self):
         super().__init__()
 
-        # common objects
-        pass
-
-        # custom service objects
-        pass
-
     def start(self):
         super().start()
-        pass
         super().started()
 
     def stop(self):
         super().stop()
-        pass
         super().stopped()
 
     def share(self, mediaitem: Mediaitem, config_index: int = 0, parameters: dict[str, str] | None = None):
@@ -49,6 +44,18 @@ class ShareService(BaseService):
         except Exception as exc:
             logger.critical(f"could not find action configuration with index {config_index}, error {exc}")
             raise exc
+
+        # check for handlesOnlyImages and abort if media_type is not an image
+        if action_config.handles_images_only and mediaitem.media_type not in ("image", "collage"):
+            # this action handles images only, so ensure it is an image, otherwise send SSE notification.
+            sse_service.dispatch_event(
+                SseEventTranslateableFrontendNotification(
+                    color="negative",
+                    message_key="share.wrong_media_type",
+                    context_data={"action_name": action_config.name},
+                )
+            )
+            raise WrongMediaTypeError(f"The action can handle only images but {mediaitem.media_type} was provided.")
 
         # check counter limit
 
@@ -84,11 +91,29 @@ class ShareService(BaseService):
 
             raise BlockingIOError(f"Request ignored! Wait {remaining_s:.0f}s before trying again.")
 
-        # filename absolute to print, use in printing command
         filename = mediaitem.processed.absolute()
+        media_type = mediaitem.media_type
+        action_config_name = action_config.name
+        printer_name = action_config.processing.printer_name
 
-        # print command
-        logger.info(f"share/print {filename=}")
+        # once unblocked, also check printer availability if configured:
+        if action_config.processing.check_if_printer_is_idle:
+            try:
+                printer_state, printer_state_raw = get_printer_status(printer_name)
+                logger.debug(f"checked {printer_state=}, {printer_state_raw=}")
+            except Exception as exc:
+                raise RuntimeError(f"Failed getting printer status, error: {exc}! Maybe the printer '{printer_name}' does not exist?") from exc
+
+            if printer_state is not PrinterStatus.OK:
+                logger.warning(f"Print command failed because PrinterStatus is not OK, error: {printer_state_raw}")
+                sse_service.dispatch_event(
+                    SseEventTranslateableFrontendNotification(
+                        color="negative",
+                        message_key="share.printer_not_ready",
+                        context_data={"action_name": action_config.name, "printer_name": printer_name},
+                    )
+                )
+                raise BlockingIOError(f"Printer {printer_name} is not available! Please check power, connectivity, paper and cartridges.")
 
         if parameters is None:
             share_parameters = {parameter.key: parameter.default for parameter in action_config.processing.parameters}
@@ -100,12 +125,21 @@ class ShareService(BaseService):
         share_parameters.pop("filename", None)  # if filename is configured by user, remove it, because the app sets it.
 
         try:
-            formatted_command = str(action_config.processing.share_command).format(filename=filename, **share_parameters)
+            formatted_command = str(action_config.processing.share_command).format(
+                filename=filename,
+                media_type=media_type,
+                action_config_name=action_config_name,
+                printer_name=action_config.processing.printer_name,
+                **share_parameters,
+            )
         except KeyError as exc:
             raise RuntimeError(f"Error in configuration! Parameter {exc} is defined in command but was not configured as parameter!") from exc
         except TypeError as exc:
             # usually this error is prevented by having the pattern= in the pydantic field in config already.
             raise RuntimeError(f"Error in configuration! Probably illegal parameter name defined, error: {exc}") from exc
+
+        # command to be executed
+        logger.info(f"executing command '{formatted_command}'")
 
         sse_service.dispatch_event(
             SseEventTranslateableFrontendNotification(
@@ -125,15 +159,24 @@ class ShareService(BaseService):
                 shell=True,  # needs to be shell so a string as command is accepted.
             )
 
-        except Exception as exc:
+        except subprocess.CalledProcessError as exc:
+            logger.error(f"Command failed: {exc.cmd}")
+            logger.error(f"Return code: {exc.returncode}")
+            logger.error(f"stdout: {exc.stdout}")
+            logger.error(f"stderr: {exc.stderr}")
+
             sse_service.dispatch_event(SseEventTranslateableFrontendNotification(color="negative", message_key="share.process_failed"))
-            raise RuntimeError(f"Process failed, error {exc}") from exc
+
+            raise RuntimeError(f"Process failed with exit code {exc.returncode}: {exc.stderr or exc.stdout}") from exc
+
+        except Exception as exc:
+            # other errors (timeout, OSError, etc.)
+            raise RuntimeError(f"Unexpected error running command: {exc}") from exc
 
         else:
             logger.info(f"cmd={completed_process.args}")
-            logger.info(f"stdout={completed_process.stdout}")
-            logger.debug(f"stderr={completed_process.stderr}")
-
+            logger.info(f"stdout={completed_process.stdout.decode(errors='replace')}")
+            logger.debug(f"stderr={completed_process.stderr.decode(errors='replace')}")
             logger.info(f"command started successfully {mediaitem}")
 
         updated_current_shares = self.limit_counter_increment(action_config.name)
@@ -156,7 +199,7 @@ class ShareService(BaseService):
         try:
             with Session(engine) as session:
                 statement = delete(ShareLimits).where(ShareLimits.action == field)
-                result = session.execute(statement)
+                result = cast(CursorResult, session.execute(statement))
                 session.commit()
 
                 logger.info(f"deleted {result.rowcount} items from ShareLimits")
@@ -168,9 +211,9 @@ class ShareService(BaseService):
         try:
             with Session(engine) as session:
                 statement = delete(ShareLimits)
-                results = session.execute(statement)
+                result = cast(CursorResult, session.execute(statement))
                 session.commit()
-                logger.info(f"deleted {results.rowcount} entries from ShareLimits")
+                logger.info(f"deleted {result.rowcount} entries from ShareLimits")
 
         except Exception as exc:
             raise RuntimeError(f"failed to reset ShareLimits, error: {exc}") from exc

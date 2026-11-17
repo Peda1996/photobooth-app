@@ -4,20 +4,26 @@ from uuid import uuid4
 
 from statemachine import Event
 
-from ... import PATH_PROCESSED, PATH_UNPROCESSED
-from ...database.models import Mediaitem, MediaitemTypes
-from ..aquisition import AquisitionService
+from ... import PATH_PROCESSED
+from ...appconfig import appconfig
+from ...database.models import Mediaitem
+from ...utils.helper import filename_str_time
+from ..acquisition import AcquisitionService
 from ..config.groups.actions import AnimationConfigurationSet, SingleImageProcessing
+from ..config.models.frameoverlay import FrameOverlay
 from ..config.models.models import PluginFilters
 from ..mediaprocessing.processes import process_and_generate_animation
-from .base import Capture, CaptureSet, JobModelBase
+from .base import JobModelBase
+from .models import Capture, CaptureSet, UiCaptureDefinition, UiFrameOverlay
 
 logger = logging.getLogger(__name__)
 
 
 class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
-    def __init__(self, configuration_set: AnimationConfigurationSet, aquisition_service: AquisitionService):
-        super().__init__(configuration_set, MediaitemTypes.animation, aquisition_service=aquisition_service)
+    _media_type = "animation"
+
+    def __init__(self, configuration_set: AnimationConfigurationSet, acquisition_service: AcquisitionService):
+        super().__init__(configuration_set, acquisition_service=acquisition_service)
 
         # self._validate_job()
 
@@ -25,11 +31,20 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
     def total_captures_to_take(self) -> int:
         return self._get_number_of_captures_from_merge_definition(self._configuration_set.processing.merge_definition)
 
-    def new_filename(self):
-        return super().new_filename() + ".gif"
+    @property
+    def captures_definition(self) -> UiCaptureDefinition | None:
+        return UiCaptureDefinition(
+            "-",
+            width=self._configuration_set.processing.canvas_width,
+            height=self._configuration_set.processing.canvas_height,
+        )
+
+    @property
+    def frame_overlay(self) -> UiFrameOverlay | None:
+        return None
 
     def on_enter_counting(self):
-        self._aquisition_service.signalbackend_configure_optimized_for_hq_preview()
+        self._acquisition_service.thrill_still()
 
         super().on_enter_counting()
 
@@ -39,9 +54,7 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
     def on_enter_capture(self):
         logger.info(f"current capture ({self.captures_taken + 1}/{self.total_captures_to_take}, remaining {self.remaining_captures_to_take - 1})")
 
-        self._aquisition_service.signalbackend_configure_optimized_for_hq_capture()
-
-        captureset = CaptureSet([Capture(self._aquisition_service.wait_for_still_file())])
+        captureset = CaptureSet([Capture(self._acquisition_service.wait_for_still_file())])
 
         # add to tmp collection
         # update model so it knows the latest number of captures and the machine can react accordingly if finished
@@ -49,7 +62,8 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
 
         logger.info(f"captureset {captureset} successful")
 
-    def on_exit_capture(self): ...
+    def on_exit_capture(self):
+        pass
 
     def on_enter_approval(self):
         # set an uuid of capture to approve
@@ -60,6 +74,7 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
         self._approval_id = None  # unset again to avoid showing old imgs accidentally
 
     def on_enter_completed(self):
+
         ## PHASE 1:
         # postprocess each capture individually
         captures_to_process = [capture_set.captures[0] for capture_set in self._capture_sets]
@@ -72,7 +87,7 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
 
             _config = SingleImageProcessing(
                 texts_enable=False,
-                img_frame_enable=False,
+                img_frame=FrameOverlay(enable=False),
                 image_filter=merge_definition_capture_only[index].image_filter if index is not None else PluginFilters("original"),
             )
 
@@ -83,7 +98,7 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
             )
             phase1_mediaitems.append(mediaitem)
 
-            logger.info(f"capture {mediaitem=} successful")
+            logger.info(f"capture {mediaitem} successful")
 
         assert len(phase1_mediaitems) > 0
 
@@ -91,24 +106,24 @@ class JobModelAnimation(JobModelBase[AnimationConfigurationSet]):
         # postprocess job as whole, create collage of single images, video...
         logger.info("start postprocessing phase 2")
 
-        original_filenamepath = self.new_filename()
+        original_filenamepath = Path(filename_str_time()).with_suffix(f".{appconfig.mediaprocessing.fileformat_animations}")
         phase2_mediaitem = Mediaitem(
             id=uuid4(),
             job_identifier=self._job_identifier,
             media_type=self._media_type,
-            unprocessed=Path(PATH_UNPROCESSED, original_filenamepath),
             processed=Path(PATH_PROCESSED, original_filenamepath),
             pipeline_config=self._configuration_set.processing.model_dump(mode="json"),
         )
 
         process_and_generate_animation([item.processed for item in phase1_mediaitems], phase2_mediaitem)
 
-        assert phase2_mediaitem.unprocessed.is_file()
         assert phase2_mediaitem.processed.is_file()
 
         # out to db/ui
         self.set_results([*phase1_mediaitems, phase2_mediaitem], phase2_mediaitem.id)
 
-    def on_exit_completed(self): ...
+    def on_exit_completed(self):
+        pass
 
-    def on_enter_finished(self): ...
+    def on_enter_finished(self):
+        pass

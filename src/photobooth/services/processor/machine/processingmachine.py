@@ -1,22 +1,14 @@
+from typing import Literal
+
 from statemachine import Event, State, StateMachine
 
-# TODO: can use as enum so fastapi can use this type also and validate states?
-# class Status(Enum):
-#     start = auto()
-#     counting = auto()
-#     capture = auto()
-#     approval = auto()
-#     completed = auto()
-#     finished = auto()
+userEvents = Literal["next", "reject", "abort"]
 
 
 class ProcessingMachine(StateMachine):
     """ """
 
     ## STATES
-
-    # _ = States.from_enum(Status, initial=Status.start, final=Status.finished)
-
     start = State(initial=True)
     counting = State()  # countdown before capture
     capture = State()  # capture from camera include postprocess single img postproc

@@ -5,11 +5,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Response, status
 from fastapi.responses import FileResponse
+from PIL import Image, ImageOps
 
+from ...appconfig import appconfig
 from ...container import container
-from ...database.models import DimensionTypes
-from ...services.collection import MAP_DIMENSION_TO_PIXEL
-from ...utils.resizer import generate_resized
+from ...utils.media_resizer import resize
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/processing", tags=["processing"])
@@ -18,10 +18,16 @@ router = APIRouter(prefix="/processing", tags=["processing"])
 @router.get("/approval/{capture_id}", response_class=Response)
 def api_get_preview_image_filtered(capture_id: UUID, background_tasks: BackgroundTasks):
     try:
-        filepath_in = container.processing_service.get_capture(capture_id).filepath
+        capture = container.processing_service.get_capture(capture_id)
+
+        filepath_in = capture.filepath
         filepath_out = Path(NamedTemporaryFile(mode="wb", delete=False, dir="tmp", prefix="approval_img_", suffix=filepath_in.suffix).name)
 
-        generate_resized(filepath_in, filepath_out, MAP_DIMENSION_TO_PIXEL[DimensionTypes.preview])
+        if capture.target_height and capture.target_width:
+            img = ImageOps.fit(Image.open(filepath_in), (capture.target_width, capture.target_height), method=Image.Resampling.BILINEAR)
+            img.save(filepath_out)
+        else:
+            resize(filepath_in, filepath_out, appconfig.mediaprocessing.preview_still_length)
 
         background_tasks.add_task(lambda path: path.unlink(), filepath_out)
 

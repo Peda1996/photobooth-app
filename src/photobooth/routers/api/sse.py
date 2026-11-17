@@ -1,6 +1,6 @@
 import logging
 from asyncio import Queue
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 from sse_starlette.event import ServerSentEvent
@@ -8,13 +8,35 @@ from sse_starlette.sse import EventSourceResponse
 
 from ...container import container
 from ...services.sse import sse_service
-from ...services.sse.sse_ import Client
+from ...services.sse.sse_ import (
+    Client,
+    SseEventDbInsert,
+    SseEventDbRemove,
+    SseEventDbUpdate,
+    SseEventIntervalInformationRecord,
+    SseEventLogRecord,
+    SseEventOnetimeInformationRecord,
+    SseEventProcessStateinfo,
+    SseEventTranslateableFrontendNotification,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["home"])
 
 
-@router.get("/sse")
+SseEventModel = (
+    SseEventTranslateableFrontendNotification
+    | SseEventProcessStateinfo
+    | SseEventDbInsert
+    | SseEventDbUpdate
+    | SseEventDbRemove
+    | SseEventLogRecord
+    | SseEventOnetimeInformationRecord
+    | SseEventIntervalInformationRecord
+)  # used to include in the api doc for typescript-opentype generator use in client.
+
+
+@router.get("/sse", response_model=SseEventModel)
 async def subscribe(request: Request):
     """
     Eventstream to feed clients with server generated events and data
@@ -28,8 +50,8 @@ async def subscribe(request: Request):
     # async since queue reuses the async thread
     # that would not be avail if outer function of queue is sync.
     # https://docs.python.org/3.11/library/asyncio-queue.html
-    queue = Queue(100)
-    client = Client(request, queue)
+    queue: Queue[ServerSentEvent] = Queue(100)
+    client: Client = Client(request, queue)
     sse_service.setup_client(client=client)
 
     # following modules send some data on connection init to client:
@@ -39,5 +61,5 @@ async def subscribe(request: Request):
     return EventSourceResponse(
         sse_service.event_iterator(client=client),
         ping=1,
-        ping_message_factory=lambda: ServerSentEvent(datetime.now(timezone.utc), event="ping"),
+        ping_message_factory=lambda: ServerSentEvent(datetime.now(UTC), event="ping"),
     )

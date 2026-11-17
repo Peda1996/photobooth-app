@@ -1,12 +1,12 @@
 from pathlib import Path
-from typing import Annotated, Generic, TypeVar
+from typing import Generic, TypeVar
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, FilePath, NonNegativeInt
+from pydantic import BaseModel, ConfigDict, Field, FilePath, NonNegativeInt
 from pydantic_extra_types.color import Color
 
+from ..models.frameoverlay import FrameOverlay
 from ..models.models import AnimationMergeDefinition, CollageMergeDefinition, PluginFilters, TextsConfig
 from ..models.trigger import GpioTrigger, KeyboardTrigger, Trigger, UiTrigger
-from ..validators import ensure_demoassets
 
 
 class SingleImageJobControl(BaseModel):
@@ -96,34 +96,40 @@ class SingleImageProcessing(BaseModel):
 
     model_config = ConfigDict(title="Single captures processing after capture")
 
-    image_filter: PluginFilters = Field(default=PluginFilters("original"))
+    remove_background: bool = Field(
+        json_schema_extra={"computeIntense": True},
+        default=False,
+        description="Use AI to remove the background from the captured image. Results may vary. There are different models available in the mediaprocessing section.",
+    )
 
     fill_background_enable: bool = Field(
         default=False,
         description="Apply solid color background to captured image (useful only if image is extended or background removed)",
     )
     fill_background_color: Color = Field(
-        default=Color("blue"),
+        default=Color("#2D68C4"),
         description="Solid color used to fill background.",
     )
     img_background_enable: bool = Field(
         default=False,
         description="Add image from file to background (useful only if image is extended or background removed)",
     )
-    img_background_file: Annotated[FilePath | None, BeforeValidator(ensure_demoassets)] = Field(
+    img_background_file: FilePath | None = Field(
         default=None,
         description="Image file to use as background filling transparent area. File needs to be located in working directory/userdata/*",
         json_schema_extra={"list_api": "/api/admin/enumerate/userfiles"},
     )
-    img_frame_enable: bool = Field(
-        default=False,
-        description="Mount captured image to frame.",
+
+    image_filter: PluginFilters = Field(default=PluginFilters("original"))
+
+    img_frame: FrameOverlay = Field(
+        default=FrameOverlay(
+            enable=False,
+            image=None,
+            mirror_effect=False,
+        ),
     )
-    img_frame_file: Annotated[FilePath | None, BeforeValidator(ensure_demoassets)] = Field(
-        default=None,
-        description="Image file to which the captured image is mounted to. Frame determines the output image size! Photos are visible through transparant parts. Image needs to be transparent (PNG). File needs to be located in userdata/*",
-        json_schema_extra={"list_api": "/api/admin/enumerate/userfiles"},
-    )
+
     texts_enable: bool = Field(
         default=False,
         description="General enable apply texts below.",
@@ -141,19 +147,25 @@ class CollageProcessing(BaseModel):
 
     ## phase 1 per capture application on collage also. settings taken from PipelineImage if needed
 
+    capture_remove_background: bool = Field(
+        json_schema_extra={"computeIntense": True},
+        default=False,
+        description="Use AI to remove the background from the captured image. Results may vary. There are different models available in the mediaprocessing section.",
+    )
+
     capture_fill_background_enable: bool = Field(
         default=False,
         description="Apply solid color background to captured image (useful only if image is extended or background removed)",
     )
     capture_fill_background_color: Color = Field(
-        default=Color("blue"),
+        default=Color("#2D68C4"),
         description="Solid color used to fill background.",
     )
     capture_img_background_enable: bool = Field(
         default=False,
         description="Add image from file to background (useful only if image is extended or background removed)",
     )
-    capture_img_background_file: Annotated[FilePath | None, BeforeValidator(ensure_demoassets)] = Field(
+    capture_img_background_file: FilePath | None = Field(
         default=None,
         description="Image file to use as background filling transparent area. File needs to be located in working directory/userdata/*",
         json_schema_extra={"list_api": "/api/admin/enumerate/userfiles"},
@@ -177,14 +189,14 @@ class CollageProcessing(BaseModel):
         description="Apply solid color background to collage",
     )
     canvas_fill_background_color: Color = Field(
-        default=Color("green"),
+        default=Color("#2e6f40"),
         description="Solid color used to fill background.",
     )
     canvas_img_background_enable: bool = Field(
         default=False,
         description="Add image from file to background.",
     )
-    canvas_img_background_file: Annotated[FilePath | None, BeforeValidator(ensure_demoassets)] = Field(
+    canvas_img_background_file: FilePath | None = Field(
         default=None,
         description="Image file to use as background filling transparent area. File needs to be located in userdata/*",
         json_schema_extra={"list_api": "/api/admin/enumerate/userfiles"},
@@ -193,7 +205,7 @@ class CollageProcessing(BaseModel):
         default=False,
         description="Overlay image on canvas image.",
     )
-    canvas_img_front_file: Annotated[FilePath | None, BeforeValidator(ensure_demoassets)] = Field(
+    canvas_img_front_file: FilePath | None = Field(
         default=None,
         description="Image file to paste on top over photos and backgrounds. Photos are visible only through transparant parts. Image needs to be transparent (PNG). File needs to be located in working directory/userdata/*",
         json_schema_extra={"list_api": "/api/admin/enumerate/userfiles"},
@@ -211,21 +223,21 @@ class CollageProcessing(BaseModel):
 class AnimationProcessing(BaseModel):
     """Configure stages how to process collage after capture."""
 
-    model_config = ConfigDict(title="Animation (GIF) processing after capture")
+    model_config = ConfigDict(title="Process animated images processing after capture")
 
     ## phase 2 per collage settings.
 
     canvas_width: int = Field(
         default=1500,
-        description="Width (X) in pixel of animation image (GIF). The higher the better the quality but also longer time to process. All processes keep aspect ratio.",
+        description="Width (X) in pixel for the resulting animated image. The higher the better the quality but also longer time to process. All processes keep aspect ratio.",
     )
     canvas_height: int = Field(
         default=900,
-        description="Height (Y) in pixel of animation image (GIF). The higher the better the quality but also longer time to process. All processes keep aspect ratio.",
+        description="Height (Y) in pixel for the resulting animated image. The higher the better the quality but also longer time to process. All processes keep aspect ratio.",
     )
     merge_definition: list[AnimationMergeDefinition] = Field(
         default=[],
-        description="Sequence images in an animated GIF. Predefined image files are used instead a camera capture. File needs to be located in working directory/userdata/*",
+        description="Sequence captures and predefined images to line up in the resulting animated image. Predefined images are used instead a camera capture. File needs to be located in working directory/userdata/*",
     )
 
 
@@ -242,6 +254,12 @@ class VideoProcessing(BaseModel):
         default=False,
         description="Create boomerang videos, the video is replayed reverse automatically.",
     )
+    boomerang_speed: float = Field(
+        default=1,
+        ge=0.5,
+        le=2,
+        description="Speed up the resulting boomerang. 1 is normal speed, 2 is double.",
+    )
     video_framerate: int = Field(
         default=25,
         ge=1,
@@ -255,16 +273,10 @@ class MulticameraProcessing(BaseModel):
 
     model_config = ConfigDict(title="Wigglegram-multicamera processing")
 
-    canvas_width: int = Field(
-        default=1500,
-        description="Width (X) in pixel of animation image (GIF). The higher the better the quality but also longer time to process. All processes keep aspect ratio.",
-    )
-    canvas_height: int = Field(
-        default=900,
-        description="Height (Y) in pixel of animation image (GIF). The higher the better the quality but also longer time to process. All processes keep aspect ratio.",
-    )
     duration: NonNegativeInt = Field(
         default=125,
+        ge=100,
+        le=500,
         description="Duration of each frame in milliseconds. Wigglegrams look good usually between 100-200ms duration.",
     )
     image_filter: PluginFilters = Field(
@@ -329,10 +341,14 @@ class GroupActions(BaseModel):
             SingleImageConfigurationSet(
                 jobcontrol=SingleImageJobControl(),
                 processing=SingleImageProcessing(
+                    remove_background=True,
                     img_background_enable=True,
-                    img_background_file=Path("userdata/demoassets/backgrounds/pink-7761356_1920.jpg"),
-                    img_frame_enable=True,
-                    img_frame_file=Path("userdata/demoassets/frames/frame_image_photobooth-app.png"),
+                    img_background_file=Path("userdata/demoassets/backgrounds/background.jpg"),
+                    img_frame=FrameOverlay(
+                        enable=True,
+                        image=Path("userdata/demoassets/frames/frame_image_photobooth-app.png"),
+                        mirror_effect=False,
+                    ),
                     texts_enable=True,
                     texts=[
                         TextsConfig(
@@ -341,7 +357,7 @@ class GroupActions(BaseModel):
                             pos_y=1250,
                             rotate=0,
                             font_size=30,
-                            color=Color("#333"),
+                            color=Color("#333333"),
                         )
                     ],
                 ),
@@ -363,6 +379,9 @@ class GroupActions(BaseModel):
                     show_individual_captures_in_gallery=True,
                 ),
                 processing=CollageProcessing(
+                    capture_remove_background=True,
+                    capture_fill_background_enable=True,
+                    capture_fill_background_color=Color("#ffffff"),
                     canvas_width=1920,
                     canvas_height=1280,
                     merge_definition=[
@@ -404,7 +423,7 @@ class GroupActions(BaseModel):
                             pos_x=200,
                             pos_y=1100,
                             rotate=1,
-                            color=Color("#333"),
+                            color=Color("#333333"),
                         )
                     ],
                 ),
@@ -442,13 +461,13 @@ class GroupActions(BaseModel):
                     ],
                 ),
                 trigger=Trigger(
-                    ui_trigger=UiTrigger(title="Animation", icon="gif_box"),
+                    ui_trigger=UiTrigger(title="Animation", icon="animated_images"),
                     gpio_trigger=GpioTrigger(pin="24"),
                     keyboard_trigger=KeyboardTrigger(keycode="g"),
                 ),
             ),
         ],
-        description="Capture GIF animation sequence consist of one or more still images. It's not a video but a low number of still images.",
+        description="Capture an animation consisting of one or more still images. It's not a video but a low number of still images.",
     )
 
     video: list[VideoConfigurationSet] = Field(
@@ -458,10 +477,11 @@ class GroupActions(BaseModel):
                 processing=VideoProcessing(
                     video_duration=5,
                     boomerang=True,
+                    boomerang_speed=2,
                     video_framerate=15,
                 ),
                 trigger=Trigger(
-                    ui_trigger=UiTrigger(title="Video", icon="movie"),
+                    ui_trigger=UiTrigger(title="Boomerang", icon="movie"),
                     gpio_trigger=GpioTrigger(pin="25"),
                     keyboard_trigger=KeyboardTrigger(keycode="v"),
                 ),
@@ -476,7 +496,7 @@ class GroupActions(BaseModel):
                 jobcontrol=MulticameraJobControl(),
                 processing=MulticameraProcessing(),
                 trigger=Trigger(
-                    ui_trigger=UiTrigger(show_button=False, title="Wigglegram", icon="burst_mode"),
+                    ui_trigger=UiTrigger(title="Wigglegram", icon="3d"),
                     gpio_trigger=GpioTrigger(pin="12"),
                     keyboard_trigger=KeyboardTrigger(keycode="w"),
                 ),

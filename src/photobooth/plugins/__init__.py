@@ -83,10 +83,11 @@ class PluginAcquisitionSpec:
         """triggers before a multicam still only"""
 
     @hookspec(firstresult=True)
-    def acq_still_check(self, file: Path) -> StillRetry | None:
+    def acq_still_check(self, file: Path, retry_attempt: int) -> StillRetry | None:
         """called with every captured still file. return None if the capture is fine, or a StillRetry to request one more capture
         (for example with different camera parameters if the image is black because the flash failed).
-        The first plugin returning a result wins. The app limits the number of retries."""
+        The first plugin returning a result wins. The app limits the number of retries.
+        retry_attempt is 0 for the original capture and counts up for photos taken by a retry, these were shot with other parameters."""
 
     @hookspec
     def acq_after_shot(self) -> None:

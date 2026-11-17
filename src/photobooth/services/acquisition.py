@@ -133,7 +133,7 @@ class AcquisitionService(BaseService):
 
             # plugins may check the image and request a retry, eg. with other camera parameters if the flash failed.
             for attempt in range(1, MAX_STILL_RETRIES + 1):
-                retry = pluggy_pm.hook.acq_still_check(file=file)
+                retry = pluggy_pm.hook.acq_still_check(file=file, retry_attempt=attempt - 1)
                 if retry is None:
                     break
 
